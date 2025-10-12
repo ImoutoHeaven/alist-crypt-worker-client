@@ -33,6 +33,8 @@ const hopByHopHeaders = new Set([
   'host',
 ]);
 
+const MAX_SUBREQUESTS_PER_SOCKET = 40;
+
 const sessionStore = new Map();
 let lastCleanup = 0;
 
@@ -455,6 +457,7 @@ const handleWebSocket = (request, config) => {
     remote: null,
     nonce: null,
     controllers: new Map(),
+    subrequestCount: 0,
   };
 
   const cleanupControllers = () => {
@@ -531,6 +534,16 @@ const handleWebSocket = (request, config) => {
   };
 
   const handleSegment = async (payload) => {
+    if (state.closing) {
+      sendJson(server, {
+        type: 'segment-error',
+        id: payload?.id ?? -1,
+        message: 'connection closing',
+        status: 410,
+        code: 'session-expired',
+      });
+      return;
+    }
     if (!state.initialized || !state.remote) {
       sendJson(server, createWebSocketErrorPayload('connection not initialized', 'not-initialized'));
       return;
@@ -546,6 +559,18 @@ const handleWebSocket = (request, config) => {
     }
     if (!Number.isFinite(length) || length === 0) {
       sendJson(server, createWebSocketErrorPayload('invalid length', 'invalid-length'));
+      return;
+    }
+
+    if (state.subrequestCount >= MAX_SUBREQUESTS_PER_SOCKET) {
+      sendJson(server, {
+        type: 'segment-error',
+        id,
+        message: 'subrequest limit reached',
+        status: 410,
+        code: 'session-expired',
+      });
+      closeWithMessage('subrequest limit reached, reconnect', 'session-expired', 1013);
       return;
     }
 
@@ -596,7 +621,21 @@ const handleWebSocket = (request, config) => {
         sendJson(server, { type: 'segment-error', id, message: 'empty response from upstream' });
         return;
       }
+      if (state.closing) {
+        sendJson(server, {
+          type: 'segment-error',
+          id,
+          message: 'connection closing',
+          status: 410,
+          code: 'session-expired',
+        });
+        return;
+      }
       sendBinarySegment(server, id, arrayBuffer);
+      state.subrequestCount += 1;
+      if (state.subrequestCount >= MAX_SUBREQUESTS_PER_SOCKET) {
+        closeWithMessage('subrequest limit reached, reconnect', 'session-expired', 1013);
+      }
     } catch (error) {
       sendJson(server, {
         type: 'segment-error',

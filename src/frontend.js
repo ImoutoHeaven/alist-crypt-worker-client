@@ -219,9 +219,12 @@ const pageScript = String.raw`
     const error = new Error(payload.message || '分段下载失败');
     if (payload.status) {
       error.status = payload.status;
-      if (payload.status === 401 || payload.status === 403) {
+      if ([401, 403, 410, 429].includes(payload.status)) {
         error.code = SESSION_EXPIRED_CODE;
       }
+    }
+    if (!error.code && payload.code === SESSION_EXPIRED_CODE) {
+      error.code = SESSION_EXPIRED_CODE;
     }
     entry.reject(error);
   };
