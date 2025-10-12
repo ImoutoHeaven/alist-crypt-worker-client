@@ -89,6 +89,77 @@ const verifySignature = async (secret, data, signature) => {
   return '';
 };
 
+const appendCandidateVariants = (target, rawValue) => {
+  if (rawValue === undefined || rawValue === null) return;
+  const value = String(rawValue).trim();
+  if (!value) return;
+  const variants = new Set([value]);
+  if (!value.startsWith('/')) {
+    variants.add(`/${value}`);
+  }
+  try {
+    const decoded = decodeURIComponent(value);
+    if (decoded && decoded !== value) {
+      variants.add(decoded);
+      if (!decoded.startsWith('/')) {
+        variants.add(`/${decoded}`);
+      }
+    }
+  } catch (error) {
+    // ignore decode errors
+  }
+  try {
+    const encoded = encodeURI(value);
+    if (encoded && encoded !== value) {
+      variants.add(encoded);
+      if (!encoded.startsWith('/')) {
+        variants.add(`/${encoded}`);
+      }
+    }
+  } catch (error) {
+    // ignore encode errors
+  }
+  variants.forEach((variant) => target.add(variant));
+};
+
+const collectVerifyCandidates = (path, meta) => {
+  const candidates = new Set();
+  appendCandidateVariants(candidates, path);
+  if (meta) {
+    appendCandidateVariants(candidates, meta.path);
+    appendCandidateVariants(candidates, meta.encrypted_path);
+    appendCandidateVariants(candidates, meta.encrypted_actual_path);
+    appendCandidateVariants(candidates, meta.remote?.raw_path);
+    appendCandidateVariants(candidates, meta.remote?.url);
+    if (meta.remote?.url) {
+      try {
+        const parsed = new URL(meta.remote.url);
+        appendCandidateVariants(candidates, parsed.pathname);
+      } catch (error) {
+        // ignore invalid url
+      }
+    }
+  }
+  return candidates;
+};
+
+const verifyWithCandidates = async (secret, sign, candidates) => {
+  if (!sign) return 'sign missing';
+  let lastError = 'sign mismatch';
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== 'string') continue;
+    const result = await verifySignature(secret, candidate, sign);
+    if (!result) {
+      return '';
+    }
+    if (result !== 'sign mismatch') {
+      return result;
+    }
+    lastError = result;
+  }
+  return lastError;
+};
+
 const cloneRemoteHeaders = (headerMap = {}) => {
   const headers = new Headers();
   Object.entries(headerMap).forEach(([key, value]) => {
@@ -243,13 +314,15 @@ const handleInfo = async (request, config) => {
   if (!path) {
     return respondJson(origin, { code: 400, message: 'path is required' }, 400);
   }
-  const verifyResult = await verifySignature(config.signSecret, path, sign);
+
+  const clientIP = request.headers.get('CF-Connecting-IP') || '';
+  const meta = await fetchCryptMeta(config, path, clientIP);
+  const verifyCandidates = collectVerifyCandidates(path, meta);
+  const verifyResult = await verifyWithCandidates(config.signSecret, sign, verifyCandidates);
   if (verifyResult) {
     return respondJson(origin, { code: 401, message: verifyResult }, 401);
   }
 
-  const clientIP = request.headers.get('CF-Connecting-IP') || '';
-  const meta = await fetchCryptMeta(config, path, clientIP);
   const remoteHeaders = sanitizeUpstreamHeaders(cloneRemoteHeaders(meta.remote?.headers));
   const headerBytes = await fetchEncryptedHeader(meta, remoteHeaders);
   const nonce = extractNonceFromHeader(headerBytes, meta.file_header_size);
@@ -260,6 +333,7 @@ const handleInfo = async (request, config) => {
         url: meta.remote.url,
         method: meta.remote.method || 'GET',
         headers: toSerializableHeaderList(remoteHeaders),
+        rawPath: meta.remote?.raw_path || '',
       },
       path,
     },
