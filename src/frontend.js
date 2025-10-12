@@ -119,8 +119,11 @@ const pageScript = String.raw`
     socket: null,
     socketReady: false,
     socketPromise: null,
+    socketSessionId: null,
     segmentResolvers: new Map(),
     inflightSegments: new Set(),
+    sessionId: null,
+    sessionExpires: null,
     total: 0,
     totalEncrypted: 0,
     blockDataSize: 0,
@@ -148,11 +151,12 @@ const pageScript = String.raw`
     ((bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3]) >>> 0;
 
   const buildWebSocketUrl = () => {
-    if (!state.infoParams) {
-      throw new Error('缺少下载参数');
+    if (!state.infoParams || !state.sessionId) {
+      throw new Error('缺少会话信息');
     }
     const url = new URL('/ws', state.infoParams.origin);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    url.searchParams.set('session', state.sessionId);
     return url.toString();
   };
 
@@ -295,37 +299,42 @@ const pageScript = String.raw`
   };
 
   const ensureSocket = async ({ force = false } = {}) => {
-    if (!force && state.socket && state.socketReady && state.socket.readyState === WebSocket.OPEN) {
-      return state.socket;
+    if (!state.sessionId) {
+      throw new Error('缺少会话');
     }
-    if (state.socketPromise) {
-      return state.socketPromise;
-    }
-    if (force && state.socket) {
+    const sessionChanged = state.socketSessionId && state.socketSessionId !== state.sessionId;
+    if ((sessionChanged || force) && state.socket) {
       try {
-        state.socket.close(1000, 'reconnect');
+        state.socket.close(1013, 'session-changed');
       } catch (error) {
         console.error(error);
       }
       state.socket = null;
       state.socketReady = false;
+      state.socketPromise = null;
+      state.socketSessionId = null;
     }
-    const info = state.infoParams;
-    if (!info) {
-      throw new Error('缺少下载参数');
+    if (!sessionChanged && !force && state.socket && state.socketReady && state.socket.readyState === WebSocket.OPEN) {
+      return state.socket;
+    }
+    if (state.socketPromise) {
+      return state.socketPromise;
     }
     const url = buildWebSocketUrl();
     state.socketPromise = new Promise((resolve, reject) => {
       const socket = new WebSocket(url);
       state.socket = socket;
       state.socketReady = false;
+      state.socketSessionId = state.sessionId;
       let settled = false;
-      const finalizeFailure = (error) => {
+      const finalizeFailure = (inputError) => {
         if (settled) return;
         settled = true;
         state.socketPromise = null;
         state.socket = null;
         state.socketReady = false;
+        state.socketSessionId = null;
+        const error = inputError instanceof Error ? inputError : new Error(String(inputError));
         failPendingSegments(error);
         reject(error);
       };
@@ -337,55 +346,25 @@ const pageScript = String.raw`
         resolve(socket);
       };
       socket.addEventListener('open', () => {
-        try {
-          socket.send(
-            JSON.stringify({
-              type: 'init',
-              path: info.path,
-              sign: info.sign,
-            }),
-          );
-        } catch (error) {
-          finalizeFailure(error instanceof Error ? error : new Error(String(error)));
-        }
+        finalizeSuccess();
       });
       socket.addEventListener('message', async (event) => {
+        if (!state.socketReady) {
+          return;
+        }
         try {
           if (typeof event.data === 'string') {
             let payload;
             try {
               payload = JSON.parse(event.data);
-            } catch (error) {
-              if (!state.socketReady) {
-                finalizeFailure(new Error('服务端返回无效 JSON'));
-              }
+            } catch (parseError) {
               return;
             }
-            if (payload.type === 'meta') {
-              const data = payload.data || {};
-              const meta = data.meta;
-              if (!meta) {
-                throw new Error('服务端未返回元数据');
-              }
-              state.meta = meta;
-              state.dataKey = base64ToUint8(meta.dataKey);
-              state.baseNonce = base64ToUint8(meta.nonce);
-              state.total = meta.size;
-              state.blockDataSize = meta.blockDataSize;
-              state.blockHeaderSize = meta.blockHeaderSize;
-              state.fileHeaderSize = meta.fileHeaderSize;
-              finalizeSuccess();
-              return;
-            }
-            if (!state.socketReady) {
-              // 忽略握手前的其他消息
+            if (!payload || typeof payload !== 'object') {
               return;
             }
             handleSocketPayload(payload);
           } else {
-            if (!state.socketReady) {
-              return;
-            }
             await handleSocketBinary(event.data);
           }
         } catch (error) {
@@ -398,15 +377,25 @@ const pageScript = String.raw`
       socket.addEventListener('close', (event) => {
         if (!settled) {
           const reason = event.reason || 'WebSocket 提前关闭';
-          finalizeFailure(new Error(reason));
+          const error = new Error(reason);
+          if (event.code === 1013 || reason === 'session-changed') {
+            error.code = SESSION_EXPIRED_CODE;
+            error.silent = true;
+          }
+          finalizeFailure(error);
           return;
         }
         state.socket = null;
         state.socketReady = false;
         state.socketPromise = null;
+        state.socketSessionId = null;
         const reason = event.reason || 'WebSocket 已关闭';
         const error = new Error(reason);
         error.code = SESSION_EXPIRED_CODE;
+        if (event.code === 1013 || reason === 'session-changed') {
+          error.silent = true;
+          log('已轮换 WebSocket 连接，任务继续进行');
+        }
         failPendingSegments(error);
         state.inflightSegments.clear();
       });
@@ -606,22 +595,79 @@ const pageScript = String.raw`
       throw new Error('缺少下载参数');
     }
 
-    await ensureSocket({ force: refresh });
-    if (!state.meta) {
-      throw new Error('缺少元数据');
+    const infoUrl = new URL('/info', state.infoParams.origin);
+    infoUrl.searchParams.set('path', state.infoParams.path);
+    infoUrl.searchParams.set('sign', state.infoParams.sign);
+
+    let response;
+    try {
+      response = await fetch(infoUrl.toString(), {
+        method: 'GET',
+        headers: {
+          accept: 'application/json',
+        },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || '网络错误');
+      throw new Error('请求信息接口失败：' + message);
     }
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      throw new Error('信息接口返回无效 JSON');
+    }
+    if (!payload || typeof payload !== 'object') {
+      throw new Error('信息接口返回空响应');
+    }
+    if (!response.ok || payload.code !== 200 || !payload.data) {
+      throw new Error(payload.message || '获取信息失败');
+    }
+
+    const data = payload.data;
+    const { session, expires, meta } = data;
+    if (!session) {
+      throw new Error('服务端未返回会话 ID');
+    }
+    if (!meta) {
+      throw new Error('服务端未返回元数据');
+    }
+
+    if (refresh && state.total > 0) {
+      if (meta.size !== state.total || meta.blockDataSize !== state.blockDataSize) {
+        throw new Error('刷新后元数据与当前会话不一致');
+      }
+    }
+
+    state.sessionId = session;
+    state.sessionExpires = expires || null;
+    state.meta = meta;
+    state.dataKey = base64ToUint8(meta.dataKey);
+    state.baseNonce = base64ToUint8(meta.nonce);
+    state.total = meta.size;
+    state.blockDataSize = meta.blockDataSize;
+    state.blockHeaderSize = meta.blockHeaderSize;
+    state.fileHeaderSize = meta.fileHeaderSize;
 
     if (refresh) {
       if (!silent) {
         log('已刷新下载会话');
       }
+      if (state.socket && state.socket.readyState === WebSocket.OPEN && state.socketSessionId !== state.sessionId) {
+        try {
+          state.socket.close(1013, 'session-changed');
+        } catch (error) {
+          console.error(error);
+        }
+      }
+      state.socket = null;
+      state.socketReady = false;
+      state.socketPromise = null;
+      state.socketSessionId = null;
       return { meta: state.meta };
     }
 
-    state.total = state.meta.size;
-    state.blockDataSize = state.meta.blockDataSize;
-    state.blockHeaderSize = state.meta.blockHeaderSize;
-    state.fileHeaderSize = state.meta.fileHeaderSize;
     state.started = false;
     state.paused = false;
     state.mode = 'idle';

@@ -444,18 +444,44 @@ const handleWebSocket = (request, config) => {
   }
 
   const clientIP = request.headers.get('CF-Connecting-IP') || '';
+  const url = new URL(request.url);
+  const sessionId = url.searchParams.get('session');
   const pair = new WebSocketPair();
   const [client, server] = Object.values(pair);
+
+  if (!sessionId) {
+    server.accept();
+    sendJson(server, createWebSocketErrorPayload('session is required', 'missing-session'));
+    server.close(1008, 'session required');
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+    });
+  }
+
+  const record = getSession(sessionId);
+  if (!record) {
+    server.accept();
+    sendJson(server, createWebSocketErrorPayload('session expired', 'session-expired'));
+    server.close(1013, 'session expired');
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+    });
+  }
 
   const state = {
     socket: server,
     config,
     clientIP,
-    initialized: false,
+    initialized: true,
     closing: false,
-    meta: null,
-    remote: null,
-    nonce: null,
+    remote: {
+      url: record.remote.url,
+      method: record.remote.method || 'GET',
+      headers: Array.isArray(record.remote.headers) ? record.remote.headers.slice() : [],
+    },
+    sessionId,
     controllers: new Map(),
     subrequestCount: 0,
   };
@@ -482,57 +508,6 @@ const handleWebSocket = (request, config) => {
     } catch (error) {
       // ignore close errors
     }
-  };
-
-  const handleInit = async (payload) => {
-    if (state.initialized) {
-      sendJson(server, createWebSocketErrorPayload('duplicate init message', 'duplicate-init'));
-      return;
-    }
-    const { path, sign } = payload;
-    if (!path) {
-      sendJson(server, createWebSocketErrorPayload('path is required', 'missing-path'));
-      server.close(1008, 'path required');
-      return;
-    }
-    if (!sign) {
-      sendJson(server, createWebSocketErrorPayload('sign is required', 'missing-sign'));
-      server.close(1008, 'sign required');
-      return;
-    }
-    let context;
-    try {
-      context = await prepareDownloadContext(config, path, sign, state.clientIP);
-    } catch (error) {
-      const code = error.code || 'init-failed';
-      if (error.status === 401 || error.status === 403) {
-        sendJson(server, createWebSocketErrorPayload(error.message, code));
-        server.close(1008, error.message.slice(0, 123));
-        return;
-      }
-      closeWithMessage(error.message || 'init failed', code);
-      return;
-    }
-
-    state.initialized = true;
-    state.meta = context.meta;
-    state.remote = {
-      url: context.meta.remote.url,
-      method: context.meta.remote.method || 'GET',
-      headers: toSerializableHeaderList(context.remoteHeaders),
-    };
-    state.nonce = context.nonce;
-
-    sendJson(server, {
-      type: 'meta',
-      data: {
-        sessionExpires: new Date(Date.now() + config.sessionTtlMs).toISOString(),
-        meta: {
-          ...formatMetaPayload(context.meta, context.nonce),
-          path,
-        },
-      },
-    });
   };
 
   const handleSegment = async (payload) => {
@@ -678,9 +653,6 @@ const handleWebSocket = (request, config) => {
         return;
       }
       switch (payload.type) {
-        case 'init':
-          handleInit(payload);
-          break;
         case 'segment':
           handleSegment(payload);
           break;
