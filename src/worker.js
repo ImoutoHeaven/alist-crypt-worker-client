@@ -243,11 +243,14 @@ const fetchCryptMeta = async (config, path, clientIP) => {
     headers,
     body: JSON.stringify({ path }),
   });
-  const contentType = response.headers.get('content-type') || '';
-  if (!contentType.includes('application/json')) {
-    throw new Error(`unexpected content-type: ${contentType}`);
+  const text = await response.text();
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch (error) {
+    const snippet = text.length > 256 ? `${text.slice(0, 256)}…` : text;
+    throw new Error(`unexpected response from crypt_meta: ${snippet}`);
   }
-  const payload = await response.json();
   if (payload.code !== 200) {
     throw new Error(payload.message || 'crypt_meta failed');
   }
