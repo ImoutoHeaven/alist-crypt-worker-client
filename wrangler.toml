@@ -1,0 +1,12 @@
+name = "alist-crypt-worker-local"
+main = "dist/worker.js"
+compatibility_date = "2024-01-01"
+
+[vars]
+ADDRESS = "https://example.com"
+TOKEN = "REPLACE_WITH_TOKEN"
+SIGN_SECRET = "REPLACE_WITH_TOKEN"
+VERIFY_HEADER = ""
+VERIFY_SECRET = ""
+IPV4_ONLY = "false"
+SESSION_TTL_SECONDS = "300"

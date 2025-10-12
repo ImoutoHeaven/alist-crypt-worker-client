@@ -1,0 +1,12 @@
+{
+  "name": "alist-crypt-worker-local",
+  "version": "0.1.0",
+  "description": "Cloudflare Worker that exposes encrypted file metadata for client-side decryption",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.23.0"
+  }
+}
