@@ -474,7 +474,9 @@ const handleWebSocket = (request, config) => {
   const closeWithMessage = (message, code = 'internal-error', status = 1011) => {
     if (state.closing) return;
     state.closing = true;
-    sendJson(server, createWebSocketErrorPayload(message, code));
+    if (code !== 'session-expired') {
+      sendJson(server, createWebSocketErrorPayload(message, code));
+    }
     try {
       server.close(status, message.slice(0, 123));
     } catch (error) {

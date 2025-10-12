@@ -14,6 +14,7 @@ const pageScript = String.raw`
   const MAX_RETRY_PER_SEGMENT = 3;
   const RETRY_DELAY_MS = 20000;
   const SESSION_EXPIRED_CODE = 'session-expired';
+  const TARGET_SEGMENT_SIZE_BYTES = 16 * 1024 * 1024;
 
   const $ = (id) => document.getElementById(id);
   const statusEl = $('status');
@@ -226,6 +227,11 @@ const pageScript = String.raw`
     if (!error.code && payload.code === SESSION_EXPIRED_CODE) {
       error.code = SESSION_EXPIRED_CODE;
     }
+    if (error.code === SESSION_EXPIRED_CODE) {
+      if (payload.status === 410 || payload.status === 429 || payload.code === SESSION_EXPIRED_CODE) {
+        error.silent = true;
+      }
+    }
     entry.reject(error);
   };
 
@@ -239,6 +245,9 @@ const pageScript = String.raw`
         handleSegmentAborted(payload);
         break;
       case 'error': {
+        if (payload.code === SESSION_EXPIRED_CODE) {
+          return;
+        }
         const error = new Error(payload.message || 'WebSocket 错误');
         if (payload.code === 'invalid-signature') {
           error.code = SESSION_EXPIRED_CODE;
@@ -530,7 +539,10 @@ const pageScript = String.raw`
   const prepareSegments = () => {
     const segments = [];
     const pending = [];
-    const segmentSize = state.blockDataSize * 16 || 64 * 1024;
+    const blockSize = state.blockDataSize || 64 * 1024;
+    const targetSize = Math.max(TARGET_SEGMENT_SIZE_BYTES, blockSize);
+    const blocksPerSegment = Math.max(1, Math.floor(targetSize / blockSize));
+    const segmentSize = blocksPerSegment * blockSize;
     let offset = 0;
     let index = 0;
     let totalEncrypted = 0;
@@ -573,7 +585,7 @@ const pageScript = String.raw`
     state.decrypted = 0;
   };
 
-  const fetchInfo = async ({ initial = false, refresh = false } = {}) => {
+  const fetchInfo = async ({ initial = false, refresh = false, silent = false } = {}) => {
     if (!refresh && !initial && !state.infoParams) {
       throw new Error('缺少初始信息');
     }
@@ -600,7 +612,9 @@ const pageScript = String.raw`
     }
 
     if (refresh) {
-      log('已刷新下载会话');
+      if (!silent) {
+        log('已刷新下载会话');
+      }
       return { meta: state.meta };
     }
 
@@ -634,19 +648,27 @@ const pageScript = String.raw`
     return { meta: state.meta };
   };
 
-  const refreshSession = async () => {
+  const refreshSession = async ({ silent = false } = {}) => {
     if (state.refreshingSession) {
       return state.refreshingSession;
     }
     const promise = (async () => {
-      setStatus('连接已断开，正在重新连接');
-      const data = await fetchInfo({ refresh: true });
+      if (!silent) {
+        setStatus('连接已断开，正在重新连接');
+      } else {
+        log('连接自动轮换以规避 Cloudflare 限制');
+      }
+      const data = await fetchInfo({ refresh: true, silent });
       if (data.meta) {
         if (data.meta.size !== state.total || data.meta.blockDataSize !== state.blockDataSize) {
           throw new Error('刷新后元数据与当前会话不一致');
         }
       }
-      setStatus('连接已恢复，继续下载');
+      if (!silent) {
+        setStatus('连接已恢复，继续下载');
+      } else {
+        log('已切换到新的连接，任务继续执行');
+      }
     })();
     state.refreshingSession = promise;
     try {
@@ -729,7 +751,7 @@ const pageScript = String.raw`
             continue;
           }
           if (error && error.code === SESSION_EXPIRED_CODE) {
-            await refreshSession();
+            await refreshSession({ silent: Boolean(error.silent) });
             enqueueSegment(index, true);
             continue;
           }
