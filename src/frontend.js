@@ -115,8 +115,11 @@ const pageScript = String.raw`
     infoParams: null,
     refreshingSession: null,
     meta: null,
-    session: null,
-    downloadUrl: '',
+    socket: null,
+    socketReady: false,
+    socketPromise: null,
+    segmentResolvers: new Map(),
+    inflightSegments: new Set(),
     total: 0,
     totalEncrypted: 0,
     blockDataSize: 0,
@@ -138,6 +141,265 @@ const pageScript = String.raw`
     lastSpeedAt: performance.now(),
     writer: null,
     workflowPromise: null,
+  };
+
+  const readUint32BE = (bytes, offset) =>
+    ((bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3]) >>> 0;
+
+  const buildWebSocketUrl = () => {
+    if (!state.infoParams) {
+      throw new Error('缺少下载参数');
+    }
+    const url = new URL('/ws', state.infoParams.origin);
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    return url.toString();
+  };
+
+  const createAbortError = () => {
+    const error = new Error('操作已取消');
+    error.name = 'AbortError';
+    return error;
+  };
+
+  const failPendingSegments = (error) => {
+    if (state.segmentResolvers.size === 0) return;
+    const failure = error instanceof Error ? error : new Error(String(error || '连接异常'));
+    if (!failure.code) {
+      failure.code = SESSION_EXPIRED_CODE;
+    }
+    state.segmentResolvers.forEach(({ reject }) => {
+      try {
+        reject(failure);
+      } catch (rejectError) {
+        console.error(rejectError);
+      }
+    });
+    state.segmentResolvers.clear();
+    state.inflightSegments.clear();
+  };
+
+  const sendSocketMessage = (payload) => {
+    if (!state.socket || state.socket.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket 未连接');
+    }
+    state.socket.send(JSON.stringify(payload));
+  };
+
+  const cancelSegment = (id) => {
+    if (!state.socket || state.socket.readyState !== WebSocket.OPEN) return;
+    try {
+      state.socket.send(
+        JSON.stringify({
+          type: 'cancel',
+          id,
+        }),
+      );
+    } catch (error) {
+      console.error(error);
+    }
+  };
+
+  const handleSegmentAborted = (payload) => {
+    const { id } = payload;
+    if (!Number.isInteger(id)) return;
+    const entry = state.segmentResolvers.get(id);
+    if (!entry) return;
+    state.segmentResolvers.delete(id);
+    state.inflightSegments.delete(id);
+    entry.reject(createAbortError());
+  };
+
+  const handleSegmentError = (payload) => {
+    const { id } = payload;
+    if (!Number.isInteger(id)) return;
+    const entry = state.segmentResolvers.get(id);
+    if (!entry) return;
+    state.segmentResolvers.delete(id);
+    state.inflightSegments.delete(id);
+    const error = new Error(payload.message || '分段下载失败');
+    if (payload.status) {
+      error.status = payload.status;
+      if (payload.status === 401 || payload.status === 403) {
+        error.code = SESSION_EXPIRED_CODE;
+      }
+    }
+    entry.reject(error);
+  };
+
+  const handleSocketPayload = (payload) => {
+    if (!payload || typeof payload !== 'object') return;
+    switch (payload.type) {
+      case 'segment-error':
+        handleSegmentError(payload);
+        break;
+      case 'segment-aborted':
+        handleSegmentAborted(payload);
+        break;
+      case 'error': {
+        const error = new Error(payload.message || 'WebSocket 错误');
+        if (payload.code === 'invalid-signature') {
+          error.code = SESSION_EXPIRED_CODE;
+        }
+        failPendingSegments(error);
+        if (state.socket && state.socket.readyState === WebSocket.OPEN) {
+          try {
+            state.socket.close(1011, 'error');
+          } catch (closeError) {
+            console.error(closeError);
+          }
+        }
+        setStatus('连接错误：' + error.message);
+        break;
+      }
+      case 'pong':
+        break;
+      default:
+        break;
+    }
+  };
+
+  const handleSocketBinary = async (data) => {
+    let bytes;
+    if (data instanceof Uint8Array) {
+      bytes = data;
+    } else if (data instanceof ArrayBuffer) {
+      bytes = new Uint8Array(data);
+    } else if (data && typeof data.arrayBuffer === 'function') {
+      const buffer = await data.arrayBuffer();
+      bytes = new Uint8Array(buffer);
+    } else {
+      return;
+    }
+    if (bytes.length < 5) return;
+    const type = bytes[0];
+    if (type !== 1) return;
+    const id = readUint32BE(bytes, 1);
+    const entry = state.segmentResolvers.get(id);
+    if (!entry) return;
+    state.segmentResolvers.delete(id);
+    state.inflightSegments.delete(id);
+    const payload = bytes.subarray(5);
+    entry.resolve(payload);
+  };
+
+  const ensureSocket = async ({ force = false } = {}) => {
+    if (!force && state.socket && state.socketReady && state.socket.readyState === WebSocket.OPEN) {
+      return state.socket;
+    }
+    if (state.socketPromise) {
+      return state.socketPromise;
+    }
+    if (force && state.socket) {
+      try {
+        state.socket.close(1000, 'reconnect');
+      } catch (error) {
+        console.error(error);
+      }
+      state.socket = null;
+      state.socketReady = false;
+    }
+    const info = state.infoParams;
+    if (!info) {
+      throw new Error('缺少下载参数');
+    }
+    const url = buildWebSocketUrl();
+    state.socketPromise = new Promise((resolve, reject) => {
+      const socket = new WebSocket(url);
+      state.socket = socket;
+      state.socketReady = false;
+      let settled = false;
+      const finalizeFailure = (error) => {
+        if (settled) return;
+        settled = true;
+        state.socketPromise = null;
+        state.socket = null;
+        state.socketReady = false;
+        failPendingSegments(error);
+        reject(error);
+      };
+      const finalizeSuccess = () => {
+        if (settled) return;
+        settled = true;
+        state.socketPromise = null;
+        state.socketReady = true;
+        resolve(socket);
+      };
+      socket.addEventListener('open', () => {
+        try {
+          socket.send(
+            JSON.stringify({
+              type: 'init',
+              path: info.path,
+              sign: info.sign,
+            }),
+          );
+        } catch (error) {
+          finalizeFailure(error instanceof Error ? error : new Error(String(error)));
+        }
+      });
+      socket.addEventListener('message', async (event) => {
+        try {
+          if (typeof event.data === 'string') {
+            let payload;
+            try {
+              payload = JSON.parse(event.data);
+            } catch (error) {
+              if (!state.socketReady) {
+                finalizeFailure(new Error('服务端返回无效 JSON'));
+              }
+              return;
+            }
+            if (payload.type === 'meta') {
+              const data = payload.data || {};
+              const meta = data.meta;
+              if (!meta) {
+                throw new Error('服务端未返回元数据');
+              }
+              state.meta = meta;
+              state.dataKey = base64ToUint8(meta.dataKey);
+              state.baseNonce = base64ToUint8(meta.nonce);
+              state.total = meta.size;
+              state.blockDataSize = meta.blockDataSize;
+              state.blockHeaderSize = meta.blockHeaderSize;
+              state.fileHeaderSize = meta.fileHeaderSize;
+              finalizeSuccess();
+              return;
+            }
+            if (!state.socketReady) {
+              // 忽略握手前的其他消息
+              return;
+            }
+            handleSocketPayload(payload);
+          } else {
+            if (!state.socketReady) {
+              return;
+            }
+            await handleSocketBinary(event.data);
+          }
+        } catch (error) {
+          finalizeFailure(error instanceof Error ? error : new Error(String(error)));
+        }
+      });
+      socket.addEventListener('error', () => {
+        finalizeFailure(new Error('WebSocket 连接异常'));
+      });
+      socket.addEventListener('close', (event) => {
+        if (!settled) {
+          const reason = event.reason || 'WebSocket 提前关闭';
+          finalizeFailure(new Error(reason));
+          return;
+        }
+        state.socket = null;
+        state.socketReady = false;
+        state.socketPromise = null;
+        const reason = event.reason || 'WebSocket 已关闭';
+        const error = new Error(reason);
+        error.code = SESSION_EXPIRED_CODE;
+        failPendingSegments(error);
+        state.inflightSegments.clear();
+      });
+    });
+    return state.socketPromise;
   };
 
   const resetProgressBars = () => {
@@ -252,11 +514,8 @@ const pageScript = String.raw`
     if (value) {
       toggleBtn.textContent = '继续下载';
       setStatus('已暂停');
-      for (const segment of state.segments) {
-        if (segment.controller) {
-          segment.controller.abort();
-        }
-      }
+      const inflight = Array.from(state.inflightSegments);
+      inflight.forEach((id) => cancelSegment(id));
     } else {
       toggleBtn.textContent = '暂停';
       setStatus('恢复下载');
@@ -285,7 +544,6 @@ const pageScript = String.raw`
         mapping,
         encrypted: null,
         retries: 0,
-        controller: null,
       });
       pending.push(index);
       totalEncrypted += mapping.underlyingLimit;
@@ -305,23 +563,11 @@ const pageScript = String.raw`
         encryptedTotal += segment.encrypted.length;
       } else {
         segment.retries = 0;
-        segment.controller = null;
         state.pendingSegments.push(segment.index);
       }
     });
     state.downloadedEncrypted = encryptedTotal;
     state.decrypted = 0;
-  };
-
-  const buildInfoUrl = () => {
-    const info = state.infoParams;
-    if (!info) {
-      throw new Error('缺少下载参数');
-    }
-    const infoUrl = new URL('/info', info.origin);
-    infoUrl.searchParams.set('path', info.path);
-    infoUrl.searchParams.set('sign', info.sign);
-    return infoUrl;
   };
 
   const fetchInfo = async ({ initial = false, refresh = false } = {}) => {
@@ -341,52 +587,48 @@ const pageScript = String.raw`
         sign,
       };
     }
+    if (!state.infoParams) {
+      throw new Error('缺少下载参数');
+    }
 
-    const infoUrl = buildInfoUrl();
-    const response = await fetch(infoUrl.toString(), {
-      headers: { Accept: 'application/json' },
-    });
-    if (!response.ok) {
-      throw new Error('获取信息失败：' + response.status);
+    await ensureSocket({ force: refresh });
+    if (!state.meta) {
+      throw new Error('缺少元数据');
     }
-    const payload = await response.json();
-    if (payload.code !== 200) {
-      throw new Error(payload.message || '接口返回异常');
-    }
-    const data = payload.data;
 
     if (refresh) {
-      state.session = data.session;
-      state.downloadUrl = data.downloadUrl;
       log('已刷新下载会话');
-      return data;
+      return { meta: state.meta };
     }
 
-    state.meta = data.meta;
-    state.session = data.session;
-    state.downloadUrl = data.downloadUrl;
-    state.total = data.meta.size;
-    state.blockDataSize = data.meta.blockDataSize;
-    state.blockHeaderSize = data.meta.blockHeaderSize;
-    state.fileHeaderSize = data.meta.fileHeaderSize;
-    state.dataKey = base64ToUint8(data.meta.dataKey);
-    state.baseNonce = base64ToUint8(data.meta.nonce);
+    state.total = state.meta.size;
+    state.blockDataSize = state.meta.blockDataSize;
+    state.blockHeaderSize = state.meta.blockHeaderSize;
+    state.fileHeaderSize = state.meta.fileHeaderSize;
     state.started = false;
     state.paused = false;
     state.mode = 'idle';
     state.resumeResolvers = [];
     state.writer = null;
+    state.segmentResolvers.clear();
+    state.inflightSegments.clear();
+    state.downloadedEncrypted = 0;
+    state.bytesSinceSpeedCheck = 0;
+    state.totalEncrypted = 0;
+    state.decrypted = 0;
+    state.segments = [];
+    state.pendingSegments = [];
     prepareSegments();
     resetProgressBars();
     updateProgress();
-    fileNameEl.textContent = data.meta.fileName || state.infoParams.path.split('/').pop() || '未命名文件';
+    fileNameEl.textContent = state.meta.fileName || state.infoParams.path.split('/').pop() || '未命名文件';
     state.infoReady = true;
     toggleBtn.textContent = '开始下载';
     toggleBtn.disabled = false;
     retryBtn.disabled = true;
     setStatus('信息获取成功，请点击“开始下载”');
     logEl.innerHTML = '';
-    return data;
+    return { meta: state.meta };
   };
 
   const refreshSession = async () => {
@@ -394,14 +636,14 @@ const pageScript = String.raw`
       return state.refreshingSession;
     }
     const promise = (async () => {
-      setStatus('会话已过期，尝试刷新…');
+      setStatus('连接已断开，正在重新连接');
       const data = await fetchInfo({ refresh: true });
       if (data.meta) {
         if (data.meta.size !== state.total || data.meta.blockDataSize !== state.blockDataSize) {
           throw new Error('刷新后元数据与当前会话不一致');
         }
       }
-      setStatus('会话刷新成功，继续下载');
+      setStatus('连接已恢复，继续下载');
     })();
     state.refreshingSession = promise;
     try {
@@ -411,36 +653,52 @@ const pageScript = String.raw`
     }
   };
 
+  const requestSegment = async (segment) => {
+    await ensureSocket();
+    return new Promise((resolve, reject) => {
+      const id = segment.index;
+      if (state.segmentResolvers.has(id)) {
+        reject(new Error('该分段正在处理中'));
+        return;
+      }
+      state.segmentResolvers.set(id, {
+        resolve: (payload) => {
+          if (payload instanceof Uint8Array) {
+            resolve(payload);
+          } else if (payload instanceof ArrayBuffer) {
+            resolve(new Uint8Array(payload));
+          } else {
+            resolve(new Uint8Array(payload));
+          }
+        },
+        reject,
+      });
+      state.inflightSegments.add(id);
+      try {
+        sendSocketMessage({
+          type: 'segment',
+          id,
+          offset: segment.mapping.underlyingOffset,
+          length: segment.mapping.underlyingLimit,
+        });
+      } catch (error) {
+        state.segmentResolvers.delete(id);
+        state.inflightSegments.delete(id);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  };
+
   const downloadSegment = async (index) => {
     const segment = state.segments[index];
     if (!segment || segment.encrypted) return;
-    const headers = new Headers();
-    const start = segment.mapping.underlyingOffset;
-    const end = start + segment.mapping.underlyingLimit - 1;
-    headers.set('Range', 'bytes=' + start + '-' + end);
-    const controller = new AbortController();
-    segment.controller = controller;
-    const response = await fetch(state.downloadUrl, {
-      method: 'GET',
-      headers,
-      signal: controller.signal,
-    });
-    segment.controller = null;
-    if (response.status === 410) {
-      const error = new Error('session expired');
-      error.code = SESSION_EXPIRED_CODE;
-      throw error;
-    }
-    if (!(response.ok || response.status === 206)) {
-      throw new Error('上游返回状态 ' + response.status);
-    }
-    const buffer = new Uint8Array(await response.arrayBuffer());
-    if (buffer.length === 0) {
+    const buffer = await requestSegment(segment);
+    if (!buffer || buffer.length === 0) {
       throw new Error('上游返回空数据');
     }
-    segment.encrypted = buffer;
-    state.downloadedEncrypted += buffer.length;
-    state.bytesSinceSpeedCheck += buffer.length;
+    segment.encrypted = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    state.downloadedEncrypted += segment.encrypted.length;
+    state.bytesSinceSpeedCheck += segment.encrypted.length;
     updateProgress();
   };
 

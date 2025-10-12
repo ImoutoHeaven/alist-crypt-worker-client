@@ -36,6 +36,22 @@ const hopByHopHeaders = new Set([
 const sessionStore = new Map();
 let lastCleanup = 0;
 
+const createHttpError = (status, message, code) => {
+  const error = new Error(message);
+  error.status = status;
+  if (code) {
+    error.code = code;
+  }
+  return error;
+};
+
+const writeUint32BE = (target, offset, value) => {
+  target[offset] = (value >>> 24) & 0xff;
+  target[offset + 1] = (value >>> 16) & 0xff;
+  target[offset + 2] = (value >>> 8) & 0xff;
+  target[offset + 3] = value & 0xff;
+};
+
 const ensureRequiredEnv = (env) => {
   REQUIRED_ENV.forEach((key) => {
     if (!env[key] || String(env[key]).trim() === '') {
@@ -278,6 +294,34 @@ const fetchEncryptedHeader = async (meta, remoteHeaders) => {
   return data;
 };
 
+const formatMetaPayload = (meta, nonce) => ({
+  path: meta.path,
+  size: meta.size,
+  fileName: meta.file_name,
+  blockDataSize: meta.block_data_size,
+  blockHeaderSize: meta.block_header_size,
+  fileHeaderSize: meta.file_header_size,
+  dataKey: meta.data_key,
+  nonce: uint8ToBase64(nonce),
+});
+
+const prepareDownloadContext = async (config, path, sign, clientIP) => {
+  const meta = await fetchCryptMeta(config, path, clientIP);
+  const verifyCandidates = collectVerifyCandidates(path, meta);
+  const verifyResult = await verifyWithCandidates(config.signSecret, sign, verifyCandidates);
+  if (verifyResult) {
+    throw createHttpError(401, verifyResult, 'invalid-signature');
+  }
+  const remoteHeaders = sanitizeUpstreamHeaders(cloneRemoteHeaders(meta.remote?.headers));
+  const headerBytes = await fetchEncryptedHeader(meta, remoteHeaders);
+  const nonce = extractNonceFromHeader(headerBytes, meta.file_header_size);
+  return {
+    meta,
+    remoteHeaders,
+    nonce,
+  };
+};
+
 const cleanupSessions = (now, ttlMs) => {
   if (now - lastCleanup < ttlMs) return;
   for (const [key, value] of sessionStore.entries()) {
@@ -319,16 +363,16 @@ const handleInfo = async (request, config) => {
   }
 
   const clientIP = request.headers.get('CF-Connecting-IP') || '';
-  const meta = await fetchCryptMeta(config, path, clientIP);
-  const verifyCandidates = collectVerifyCandidates(path, meta);
-  const verifyResult = await verifyWithCandidates(config.signSecret, sign, verifyCandidates);
-  if (verifyResult) {
-    return respondJson(origin, { code: 401, message: verifyResult }, 401);
+  let context;
+  try {
+    context = await prepareDownloadContext(config, path, sign, clientIP);
+  } catch (error) {
+    if (error.status) {
+      return respondJson(origin, { code: error.status, message: error.message }, error.status);
+    }
+    throw error;
   }
-
-  const remoteHeaders = sanitizeUpstreamHeaders(cloneRemoteHeaders(meta.remote?.headers));
-  const headerBytes = await fetchEncryptedHeader(meta, remoteHeaders);
-  const nonce = extractNonceFromHeader(headerBytes, meta.file_header_size);
+  const { meta, remoteHeaders, nonce } = context;
 
   const { id: sessionId, expires } = storeSession(
     {
@@ -354,18 +398,277 @@ const handleInfo = async (request, config) => {
       expires: new Date(expires).toISOString(),
       downloadUrl: downloadUrl.toString(),
       meta: {
+        ...formatMetaPayload(meta, nonce),
         path,
-        size: meta.size,
-        fileName: meta.file_name,
-        blockDataSize: meta.block_data_size,
-        blockHeaderSize: meta.block_header_size,
-        fileHeaderSize: meta.file_header_size,
-        dataKey: meta.data_key,
-        nonce: uint8ToBase64(nonce),
       },
     },
   };
   return respondJson(origin, responsePayload, 200);
+};
+
+const createWebSocketErrorPayload = (message, code) => ({
+  type: 'error',
+  message,
+  code,
+});
+
+const sendJson = (socket, payload) => {
+  try {
+    socket.send(JSON.stringify(payload));
+  } catch (error) {
+    // ignore failures when socket is closed
+  }
+};
+
+const sendBinarySegment = (socket, segmentId, data) => {
+  const body = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const payload = new Uint8Array(body.byteLength + 5);
+  payload[0] = 1;
+  writeUint32BE(payload, 1, segmentId >>> 0);
+  payload.set(body, 5);
+  socket.send(payload);
+};
+
+const handleWebSocket = (request, config) => {
+  const upgrade = request.headers.get('Upgrade');
+  if (!upgrade || upgrade.toLowerCase() !== 'websocket') {
+    return new Response('Expected WebSocket upgrade', {
+      status: 426,
+      headers: {
+        Connection: 'Upgrade',
+        Upgrade: 'websocket',
+      },
+    });
+  }
+
+  const clientIP = request.headers.get('CF-Connecting-IP') || '';
+  const pair = new WebSocketPair();
+  const [client, server] = Object.values(pair);
+
+  const state = {
+    socket: server,
+    config,
+    clientIP,
+    initialized: false,
+    closing: false,
+    meta: null,
+    remote: null,
+    nonce: null,
+    controllers: new Map(),
+  };
+
+  const cleanupControllers = () => {
+    state.controllers.forEach((controller) => {
+      try {
+        controller.abort('socket-closed');
+      } catch (error) {
+        // ignore abort error
+      }
+    });
+    state.controllers.clear();
+  };
+
+  const closeWithMessage = (message, code = 'internal-error', status = 1011) => {
+    if (state.closing) return;
+    state.closing = true;
+    sendJson(server, createWebSocketErrorPayload(message, code));
+    try {
+      server.close(status, message.slice(0, 123));
+    } catch (error) {
+      // ignore close errors
+    }
+  };
+
+  const handleInit = async (payload) => {
+    if (state.initialized) {
+      sendJson(server, createWebSocketErrorPayload('duplicate init message', 'duplicate-init'));
+      return;
+    }
+    const { path, sign } = payload;
+    if (!path) {
+      sendJson(server, createWebSocketErrorPayload('path is required', 'missing-path'));
+      server.close(1008, 'path required');
+      return;
+    }
+    if (!sign) {
+      sendJson(server, createWebSocketErrorPayload('sign is required', 'missing-sign'));
+      server.close(1008, 'sign required');
+      return;
+    }
+    let context;
+    try {
+      context = await prepareDownloadContext(config, path, sign, state.clientIP);
+    } catch (error) {
+      const code = error.code || 'init-failed';
+      if (error.status === 401 || error.status === 403) {
+        sendJson(server, createWebSocketErrorPayload(error.message, code));
+        server.close(1008, error.message.slice(0, 123));
+        return;
+      }
+      closeWithMessage(error.message || 'init failed', code);
+      return;
+    }
+
+    state.initialized = true;
+    state.meta = context.meta;
+    state.remote = {
+      url: context.meta.remote.url,
+      method: context.meta.remote.method || 'GET',
+      headers: toSerializableHeaderList(context.remoteHeaders),
+    };
+    state.nonce = context.nonce;
+
+    sendJson(server, {
+      type: 'meta',
+      data: {
+        sessionExpires: new Date(Date.now() + config.sessionTtlMs).toISOString(),
+        meta: {
+          ...formatMetaPayload(context.meta, context.nonce),
+          path,
+        },
+      },
+    });
+  };
+
+  const handleSegment = async (payload) => {
+    if (!state.initialized || !state.remote) {
+      sendJson(server, createWebSocketErrorPayload('connection not initialized', 'not-initialized'));
+      return;
+    }
+    const { id, offset, length } = payload;
+    if (!Number.isInteger(id) || id < 0) {
+      sendJson(server, createWebSocketErrorPayload('invalid segment id', 'invalid-segment'));
+      return;
+    }
+    if (!Number.isFinite(offset) || offset < 0) {
+      sendJson(server, createWebSocketErrorPayload('invalid offset', 'invalid-offset'));
+      return;
+    }
+    if (!Number.isFinite(length) || length === 0) {
+      sendJson(server, createWebSocketErrorPayload('invalid length', 'invalid-length'));
+      return;
+    }
+
+    const headers = headersFromList(state.remote.headers);
+    if (length > 0) {
+      headers.set('Range', `bytes=${offset}-${offset + length - 1}`);
+    } else {
+      headers.set('Range', `bytes=${offset}-`);
+    }
+
+    const controller = new AbortController();
+    state.controllers.set(id, controller);
+    let response;
+    try {
+      response = await fetch(state.remote.url, {
+        method: state.remote.method,
+        headers,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      state.controllers.delete(id);
+      if (controller.signal.aborted) {
+        sendJson(server, { type: 'segment-aborted', id });
+        return;
+      }
+      sendJson(server, {
+        type: 'segment-error',
+        id,
+        message: error.message || 'failed to reach upstream',
+      });
+      return;
+    }
+
+    state.controllers.delete(id);
+    if (!(response.ok || response.status === 206)) {
+      sendJson(server, {
+        type: 'segment-error',
+        id,
+        message: `upstream request failed: ${response.status}`,
+        status: response.status,
+      });
+      return;
+    }
+
+    try {
+      const arrayBuffer = await response.arrayBuffer();
+      if (!arrayBuffer || arrayBuffer.byteLength === 0) {
+        sendJson(server, { type: 'segment-error', id, message: 'empty response from upstream' });
+        return;
+      }
+      sendBinarySegment(server, id, arrayBuffer);
+    } catch (error) {
+      sendJson(server, {
+        type: 'segment-error',
+        id,
+        message: error.message || 'failed to read upstream response',
+      });
+    }
+  };
+
+  const handleCancel = (payload) => {
+    const { id } = payload;
+    if (!Number.isInteger(id)) return;
+    const controller = state.controllers.get(id);
+    if (!controller) return;
+    controller.abort('client-cancelled');
+    state.controllers.delete(id);
+    sendJson(server, { type: 'segment-aborted', id });
+  };
+
+  server.accept();
+
+  server.addEventListener('message', (event) => {
+    if (state.closing) return;
+    try {
+      if (typeof event.data !== 'string') {
+        sendJson(server, createWebSocketErrorPayload('binary message not supported', 'invalid-payload'));
+        return;
+      }
+      let payload;
+      try {
+        payload = JSON.parse(event.data);
+      } catch (error) {
+        sendJson(server, createWebSocketErrorPayload('invalid json payload', 'invalid-json'));
+        return;
+      }
+      if (!payload || typeof payload !== 'object') {
+        sendJson(server, createWebSocketErrorPayload('invalid message format', 'invalid-message'));
+        return;
+      }
+      switch (payload.type) {
+        case 'init':
+          handleInit(payload);
+          break;
+        case 'segment':
+          handleSegment(payload);
+          break;
+        case 'cancel':
+          handleCancel(payload);
+          break;
+        case 'ping':
+          sendJson(server, { type: 'pong', ts: Date.now() });
+          break;
+        default:
+          sendJson(server, createWebSocketErrorPayload('unknown message type', 'unknown-type'));
+          break;
+      }
+    } catch (error) {
+      closeWithMessage(error.message || 'internal error');
+    }
+  });
+
+  server.addEventListener('close', () => {
+    cleanupControllers();
+  });
+  server.addEventListener('error', () => {
+    cleanupControllers();
+  });
+
+  return new Response(null, {
+    status: 101,
+    webSocket: client,
+  });
 };
 
 const handleFetch = async (request) => {
@@ -448,6 +751,9 @@ const routeRequest = async (request, config) => {
   }
   if (request.method === 'GET' && pathname === '/fetch') {
     return handleFetch(request);
+  }
+  if (request.method === 'GET' && pathname === '/ws') {
+    return handleWebSocket(request, config);
   }
   return handleFileRequest(request);
 };

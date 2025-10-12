@@ -16,21 +16,22 @@ Worker variant that keeps server-side logic to authentication, metadata retrieva
 
 ## Endpoints
 
-- `GET /:path?sign=...` – primary entry point. When opened in a browser it renders a download dashboard (progress, speed, pause/resume, auto-retry). The page requests metadata via `/info` and decrypts the file locally before saving it to disk.
-- `GET /info?path=<path>&sign=<signature>` – returns metadata and a short-lived session id. The response includes `dataKey`, nonce, block sizes, and a Worker-relative download URL for encrypted bytes.
-- `GET /fetch?session=<sessionId>` – streams encrypted content by proxying the upstream file. Accepts `Range` headers and mirrors relevant response headers while keeping upstream authorization details opaque.
+- `GET /:path?sign=...` – primary entry point. When opened in a browser it renders a download dashboard (progress, speed, pause/resume, auto-retry) and establishes a WebSocket session automatically.
+- `GET /ws` – upgrades to a WebSocket connection. After sending an `init` message (`{ type: "init", path, sign }`) the Worker responds with metadata (`dataKey`, nonce, block sizes, etc.) and subsequently serves encrypted segments via binary frames. Supported commands include `segment` (start/continue a range), `cancel` (abort an in-flight range), and `ping`.
+- `GET /info?path=<path>&sign=<signature>` – compatibility endpoint returning metadata plus a short-lived session id for HTTP-based downloads.
+- `GET /fetch?session=<sessionId>` – compatibility endpoint that proxies encrypted content over HTTP. Accepts `Range` headers and mirrors relevant response headers while keeping upstream authorization details opaque.
 
-Example workflow:
+Example workflow (WebSocket):
 
-1. Client requests `/info` with the original file path and signed query. Save `dataKey`, `nonce`, `block_*` sizes, `size`, and `downloadUrl` from the JSON payload.
-2. Client issues one or more ranged requests to `downloadUrl` and decrypts blocks locally using the provided metadata.
-3. If the session expires or a `410` is returned, request `/info` again to refresh the metadata.
+1. Client connects to `/ws`, sends an `init` message with the signed path, and receives metadata (`dataKey`, nonce, block sizes, file size/name).
+2. Client sends `segment` commands (optionally in parallel) describing underlying offsets/lengths; the Worker replies with binary frames containing encrypted bytes for each segment id.
+3. Client decrypts segments locally and optionally sends `cancel` to pause/stop workers; if the connection closes the client simply reconnects and resumes requesting remaining segments.
 
 > ℹ️ The in-browser decryptor loads `tweetnacl` from the public CDN `https://cdn.jsdelivr.net`. Ensure outbound access to that domain is permitted, or vendor the asset if offline operation is required.
 
 ## Browser downloader
 
-The built-in front-end fetches metadata first, then performs a **four-threaded ranged download** of the encrypted payload, followed by client-side decryption and saving. Users can pause/resume while the download is in progress; each segment is retried up to three times (20 s backoff) and completed blocks are preserved between retries. If the Worker session expires, the page transparently refreshes the session and continues without losing progress. Because decryption happens after all segments are downloaded, browsers avoid CPU throttling issues previously observed inside Workers.
+The built-in front-end now maintains a single WebSocket to drive a **four-threaded segmented download**. Metadata exchange happens during the WebSocket handshake; encrypted segments stream back as binary frames, and the page decrypts everything locally before saving. Pause/resume triggers `cancel` messages for in-flight segments, retries are still capped at three attempts with 20 s backoff, and reconnection is handled automatically when the Worker signals a session expiry or the socket closes. Because decryption happens after all segments arrive, browsers avoid CPU throttling issues previously observed inside Workers.
 
 ## Development
 
