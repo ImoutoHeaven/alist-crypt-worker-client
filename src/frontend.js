@@ -216,6 +216,32 @@ const pageScript = String.raw`
     decryptText.textContent = decryptPercent.toFixed(2) + '% (' + formatBytes(state.decrypted) + ' / ' + formatBytes(totalPlain) + ')';
   };
 
+  const updateToggleLabel = () => {
+    if (!state.started || state.mode === 'idle') {
+      toggleBtn.textContent = '开始下载';
+      return;
+    }
+    if (state.mode === 'downloading') {
+      toggleBtn.textContent = state.paused ? '继续下载' : '暂停下载';
+      return;
+    }
+    if (state.mode === 'decrypting') {
+      toggleBtn.textContent = state.paused ? '继续解密' : '暂停解密';
+      return;
+    }
+    if (state.mode === 'finished') {
+      toggleBtn.textContent = '完成';
+      return;
+    }
+    toggleBtn.textContent = '处理中';
+  };
+
+  const waitWhilePaused = async () => {
+    while (state.paused) {
+      await waitForResume();
+    }
+  };
+
   const updateSpeed = () => {
     const now = performance.now();
     const elapsed = (now - state.lastSpeedAt) / 1000;
@@ -299,23 +325,27 @@ const pageScript = String.raw`
   };
 
   const setPaused = (value) => {
-    if (state.mode !== 'downloading') return;
+    if (!state.started) return;
+    if (state.mode !== 'downloading' && state.mode !== 'decrypting') return;
     if (state.paused === value) return;
     state.paused = value;
     if (value) {
-      toggleBtn.textContent = '继续下载';
-      setStatus('下载已暂停');
-      for (const segment of state.segments) {
-        if (segment.controller) {
-          segment.controller.abort();
+      if (state.mode === 'downloading') {
+        setStatus('下载已暂停');
+        for (const segment of state.segments) {
+          if (segment.controller) {
+            segment.controller.abort();
+          }
         }
+      } else {
+        setStatus('解密已暂停');
       }
     } else {
-      toggleBtn.textContent = '暂停';
-      setStatus('恢复下载');
+      setStatus(state.mode === 'decrypting' ? '恢复解密' : '恢复下载');
       const resolvers = state.resumeResolvers.splice(0, state.resumeResolvers.length);
       resolvers.forEach((resolve) => resolve());
     }
+    updateToggleLabel();
   };
 
   const prepareSegments = () => {
@@ -366,6 +396,55 @@ const pageScript = String.raw`
     state.decrypted = 0;
   };
 
+  const restoreCompletedSegments = (previousSegments, previousMeta, nextMeta) => {
+    if (!Array.isArray(previousSegments) || previousSegments.length === 0) {
+      return 0;
+    }
+    if (!previousMeta || !nextMeta) {
+      return 0;
+    }
+    const comparableKeys = ['blockDataSize', 'blockHeaderSize', 'fileHeaderSize', 'size'];
+    const incompatible = comparableKeys.some((key) => {
+      const prevValue = Number(previousMeta[key]);
+      const nextValue = Number(nextMeta[key]);
+      return Number.isFinite(prevValue) && Number.isFinite(nextValue) && prevValue !== nextValue;
+    });
+    if (incompatible) {
+      return 0;
+    }
+    const previousMap = new Map();
+    previousSegments.forEach((segment) => {
+      if (!segment || !(segment.encrypted instanceof Uint8Array) || segment.encrypted.length === 0) {
+        return;
+      }
+      const key = segment.offset + ':' + segment.length;
+      if (!previousMap.has(key)) {
+        previousMap.set(key, segment);
+      }
+    });
+    let reused = 0;
+    let encryptedTotal = 0;
+    const pending = [];
+    state.segments.forEach((segment) => {
+      const key = segment.offset + ':' + segment.length;
+      const previous = previousMap.get(key);
+      segment.controller = null;
+      segment.retries = 0;
+      if (previous) {
+        segment.encrypted = previous.encrypted;
+        encryptedTotal += previous.encrypted.length;
+        reused += 1;
+      } else {
+        segment.encrypted = null;
+        pending.push(segment.index);
+      }
+    });
+    state.pendingSegments = pending;
+    state.downloadedEncrypted = encryptedTotal;
+    state.decrypted = 0;
+    return reused;
+  };
+
   const buildInfoUrl = () => {
     const info = state.infoParams;
     if (!info) {
@@ -386,6 +465,8 @@ const pageScript = String.raw`
     }
     const meta = data.meta;
     const download = data.download;
+    const previousMeta = state.meta;
+    const previousSegments = state.segments;
 
     state.meta = meta;
     state.remote = {
@@ -410,14 +491,20 @@ const pageScript = String.raw`
 
     prepareSegments();
     resetProgressBars();
+    const reusedSegments = restoreCompletedSegments(previousSegments, previousMeta, meta);
     updateProgress();
     fileNameEl.textContent = meta.fileName || state.infoParams.path.split('/').pop() || '未命名文件';
     state.infoReady = true;
-    toggleBtn.textContent = '开始下载';
+    updateToggleLabel();
     toggleBtn.disabled = false;
     retryBtn.disabled = true;
     logEl.innerHTML = '';
-    setStatus(fromCache ? '已从缓存恢复下载信息，随时可以开始下载。' : '信息获取成功，可以开始下载。');
+    const statusMessage = fromCache
+      ? '已从缓存恢复下载信息，随时可以开始下载。'
+      : reusedSegments > 0
+        ? '信息获取成功，已保留 ' + reusedSegments + ' 个已完成分段，可继续下载。'
+        : '信息获取成功，可以开始下载。';
+    setStatus(statusMessage);
   };
 
   const fetchInfo = async ({ initial = false, forceRefresh = false } = {}) => {
@@ -495,53 +582,63 @@ const pageScript = String.raw`
 
     const controller = new AbortController();
     segment.controller = controller;
-    const response = await fetch(state.remote.url, {
-      method: state.remote.method || 'GET',
-      headers,
-      signal: controller.signal,
-    });
-    segment.controller = null;
-
-    if (!(response.ok || response.status === 206)) {
-      throw new Error('远程响应状态 ' + response.status);
-    }
     const chunks = [];
     let received = 0;
-    const reader = response.body && response.body.getReader ? response.body.getReader() : null;
-    if (reader) {
-      // Stream the response to update progress incrementally.
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (!value || value.length === 0) continue;
-        chunks.push(value);
-        received += value.length;
-        state.downloadedEncrypted += value.length;
-        state.bytesSinceSpeedCheck += value.length;
+    try {
+      const response = await fetch(state.remote.url, {
+        method: state.remote.method || 'GET',
+        headers,
+        signal: controller.signal,
+      });
+      if (!(response.ok || response.status === 206)) {
+        throw new Error('远程响应状态 ' + response.status);
+      }
+      const reader = response.body && response.body.getReader ? response.body.getReader() : null;
+      if (reader) {
+        // Stream the response to update progress incrementally.
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (!value || value.length === 0) continue;
+          chunks.push(value);
+          received += value.length;
+          state.downloadedEncrypted += value.length;
+          state.bytesSinceSpeedCheck += value.length;
+          updateProgress();
+        }
+      } else {
+        const arrayBuffer = await response.arrayBuffer();
+        const chunk = new Uint8Array(arrayBuffer);
+        if (chunk.length > 0) {
+          chunks.push(chunk);
+          received += chunk.length;
+          state.downloadedEncrypted += chunk.length;
+          state.bytesSinceSpeedCheck += chunk.length;
+          updateProgress();
+        }
+      }
+
+      if (received === 0) {
+        throw new Error('远程响应为空');
+      }
+      const buffer = new Uint8Array(received);
+      let position = 0;
+      for (const chunk of chunks) {
+        buffer.set(chunk, position);
+        position += chunk.length;
+      }
+      segment.encrypted = buffer;
+      updateProgress();
+    } catch (error) {
+      if (received > 0) {
+        state.downloadedEncrypted = Math.max(0, state.downloadedEncrypted - received);
+        state.bytesSinceSpeedCheck = Math.max(0, state.bytesSinceSpeedCheck - received);
         updateProgress();
       }
-    } else {
-      const arrayBuffer = await response.arrayBuffer();
-      const chunk = new Uint8Array(arrayBuffer);
-      if (chunk.length > 0) {
-        chunks.push(chunk);
-        received += chunk.length;
-        state.downloadedEncrypted += chunk.length;
-        state.bytesSinceSpeedCheck += chunk.length;
-      }
+      throw error;
+    } finally {
+      segment.controller = null;
     }
-
-    if (received === 0) {
-      throw new Error('远程响应为空');
-    }
-    const buffer = new Uint8Array(received);
-    let position = 0;
-    for (const chunk of chunks) {
-      buffer.set(chunk, position);
-      position += chunk.length;
-    }
-    segment.encrypted = buffer;
-    updateProgress();
   };
 
   const downloadAllSegments = async () => {
@@ -636,6 +733,9 @@ const decryptSegment = async (segment) => {
     let offset = 0;
 
     while (offset < buffer.length && produced < totalNeeded) {
+      if (state.paused) {
+        await waitWhilePaused();
+      }
       if (offset + state.blockHeaderSize > buffer.length) {
         throw new Error('加密块头不足');
       }
@@ -690,6 +790,9 @@ const decryptSegment = async (segment) => {
   const decryptAllSegments = async () => {
     setStatus('下载完成，准备解密');
     for (const segment of state.segments) {
+      if (state.paused) {
+        await waitWhilePaused();
+      }
       await decryptSegment(segment);
     }
   };
@@ -708,7 +811,7 @@ const decryptSegment = async (segment) => {
         state.started = true;
         state.paused = false;
         state.mode = 'downloading';
-        toggleBtn.textContent = '暂停';
+        updateToggleLabel();
         toggleBtn.disabled = false;
         retryBtn.disabled = true;
         setStatus('开始下载，目标速率 ' + REQUESTS_PER_SECOND + ' 请求/秒');
@@ -723,15 +826,16 @@ const decryptSegment = async (segment) => {
         }
         updateSpeed();
         state.mode = 'decrypting';
-        toggleBtn.textContent = '处理中';
-        toggleBtn.disabled = true;
+        state.paused = false;
+        updateToggleLabel();
+        toggleBtn.disabled = false;
         setStatus('所有分段下载完成，开始解密');
         await decryptAllSegments();
         state.decrypted = state.total;
         updateProgress();
         await finalizeWriter();
         state.mode = 'finished';
-        toggleBtn.textContent = '完成';
+        updateToggleLabel();
         setStatus('下载完成，文件已保存');
         retryBtn.disabled = true;
       } catch (error) {
@@ -741,17 +845,19 @@ const decryptSegment = async (segment) => {
         } else if (error instanceof Error) {
           setStatus('流程失败：' + error.message);
           retryBtn.disabled = false;
-          toggleBtn.textContent = '开始下载';
           toggleBtn.disabled = false;
+          state.paused = false;
           state.started = false;
           state.mode = 'idle';
+          updateToggleLabel();
         } else {
           setStatus('流程失败：发生未知错误');
           retryBtn.disabled = false;
-          toggleBtn.textContent = '开始下载';
           toggleBtn.disabled = false;
+          state.paused = false;
           state.started = false;
           state.mode = 'idle';
+          updateToggleLabel();
         }
       } finally {
         if (state.speedTimer) {
@@ -770,7 +876,7 @@ toggleBtn.addEventListener('click', () => {
       startWorkflow();
       return;
     }
-    if (state.mode === 'downloading') {
+    if (state.mode === 'downloading' || state.mode === 'decrypting') {
       setPaused(!state.paused);
     }
   });
