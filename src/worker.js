@@ -261,6 +261,7 @@ const handleInfo = async (request, config) => {
   const url = new URL(request.url);
   const path = url.searchParams.get('path');
   const sign = url.searchParams.get('sign') || '';
+  const retry = url.searchParams.get('retry') || '';
   if (!path) {
     return respondJson(origin, { code: 400, message: 'path is required' }, 400);
   }
@@ -295,6 +296,9 @@ const handleInfo = async (request, config) => {
         fileHeaderSize: meta.file_header_size,
         dataKey: meta.data_key,
         nonce: uint8ToBase64(nonce),
+      },
+      settings: {
+        segmentRetry: retry,
       },
     },
   };

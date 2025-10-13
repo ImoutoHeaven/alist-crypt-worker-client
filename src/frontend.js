@@ -12,7 +12,8 @@ const pageScript = String.raw`
 
   const REQUESTS_PER_SECOND = 4;
   const REQUEST_INTERVAL_MS = Math.floor(1000 / REQUESTS_PER_SECOND);
-  const MAX_RETRY_PER_SEGMENT = 3;
+  const DEFAULT_SEGMENT_RETRY_LIMIT = 10;
+  const INFINITE_RETRY_TOKEN = 'inf';
   const RETRY_DELAY_MS = 20000;
   const SEGMENT_SIZE_BYTES = 32 * 1024 * 1024;
   const $ = (id) => document.getElementById(id);
@@ -25,6 +26,11 @@ const pageScript = String.raw`
   const speedText = $('speedText');
   const toggleBtn = $('toggleBtn');
   const retryBtn = $('retryBtn');
+  const advancedToggleBtn = $('advancedToggle');
+  const advancedPanel = $('advancedPanel');
+  const advancedBackdrop = $('advancedBackdrop');
+  const advancedCloseBtn = $('advancedCloseBtn');
+  const retryLimitInput = $('retryLimitInput');
   const clearCacheBtn = $('clearCacheBtn');
   const clearEnvBtn = $('clearEnvBtn');
   const logEl = $('log');
@@ -35,6 +41,16 @@ const pageScript = String.raw`
     entry.textContent = '[' + time + '] ' + message;
     logEl.appendChild(entry);
     logEl.scrollTop = logEl.scrollHeight;
+  };
+
+  const markNonRetryable = (error, hint) => {
+    if (error && typeof error === 'object') {
+      error.retryable = false;
+      if (hint) {
+        error.retryHint = hint;
+      }
+    }
+    return error;
   };
 
   const setStatus = (text) => {
@@ -126,6 +142,9 @@ const pageScript = String.raw`
     fileHeaderSize: 0,
     dataKey: null,
     baseNonce: null,
+    segmentRetryLimit: DEFAULT_SEGMENT_RETRY_LIMIT,
+    segmentRetryRaw: String(DEFAULT_SEGMENT_RETRY_LIMIT),
+    advancedOpen: false,
     segments: [],
     pendingSegments: [],
     downloadedEncrypted: 0,
@@ -143,6 +162,102 @@ const pageScript = String.raw`
     writerKey: '',
     workflowPromise: null,
   };
+
+  const formatRetryLimit = (value) => (Number.isFinite(value) ? String(value) + ' 次' : '无限重试');
+
+  const persistRetrySetting = (rawValue) => {
+    if (typeof window === 'undefined' || !window.location || !window.history || !window.history.replaceState) {
+      return;
+    }
+    try {
+      const url = new URL(window.location.href);
+      if (rawValue && rawValue !== String(DEFAULT_SEGMENT_RETRY_LIMIT)) {
+        url.searchParams.set('retry', rawValue);
+      } else {
+        url.searchParams.delete('retry');
+      }
+      const nextHref = url.toString();
+      if (nextHref !== window.location.href) {
+        window.history.replaceState(null, '', nextHref);
+      }
+    } catch (error) {
+      console.warn('更新 retry 参数失败', error);
+    }
+  };
+
+  const syncRetryInput = () => {
+    if (retryLimitInput) {
+      retryLimitInput.value = state.segmentRetryRaw;
+    }
+  };
+
+  const syncAdvancedPanel = () => {
+    if (!advancedPanel || !advancedToggleBtn || !advancedBackdrop) return;
+    if (state.advancedOpen) {
+      advancedPanel.classList.add('is-open');
+      advancedPanel.setAttribute('aria-hidden', 'false');
+      advancedBackdrop.hidden = false;
+      advancedToggleBtn.setAttribute('aria-expanded', 'true');
+    } else {
+      advancedPanel.classList.remove('is-open');
+      advancedPanel.setAttribute('aria-hidden', 'true');
+      advancedBackdrop.hidden = true;
+      advancedToggleBtn.setAttribute('aria-expanded', 'false');
+    }
+  };
+
+  const openAdvancedPanel = () => {
+    if (state.advancedOpen) return;
+    state.advancedOpen = true;
+    syncAdvancedPanel();
+  };
+
+  const closeAdvancedPanel = ({ restoreFocus = false } = {}) => {
+    if (!state.advancedOpen) return;
+    state.advancedOpen = false;
+    syncAdvancedPanel();
+    if (restoreFocus && advancedToggleBtn) {
+      advancedToggleBtn.focus({ preventScroll: true });
+    }
+  };
+
+  const applySegmentRetryValue = (inputValue, { notify = false, persist = true } = {}) => {
+    const rawInput = typeof inputValue === 'string' ? inputValue.trim() : '';
+    if (!rawInput) {
+      return { ok: false, reason: 'empty' };
+    }
+    const lower = rawInput.toLowerCase();
+    let limit = null;
+    let raw = rawInput;
+    if (lower === INFINITE_RETRY_TOKEN) {
+      limit = Infinity;
+      raw = INFINITE_RETRY_TOKEN;
+    } else {
+      const parsed = Number.parseInt(rawInput, 10);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        return { ok: false, reason: 'invalid' };
+      }
+      limit = parsed;
+      raw = String(parsed);
+    }
+    state.segmentRetryLimit = limit;
+    state.segmentRetryRaw = raw;
+    syncRetryInput();
+    if (persist) {
+      persistRetrySetting(raw);
+    }
+    if (notify) {
+      log('分段重试次数已更新为 ' + formatRetryLimit(limit));
+    }
+    return { ok: true, limit, raw };
+  };
+
+  if (advancedToggleBtn) {
+    advancedToggleBtn.setAttribute('aria-controls', 'advancedPanel');
+    advancedToggleBtn.setAttribute('aria-expanded', 'false');
+  }
+  syncAdvancedPanel();
+  syncRetryInput();
 
   const STORAGE_PREFIX = 'alist-crypt-info::';
   const STORAGE_VERSION = 1;
@@ -683,6 +798,7 @@ const pageScript = String.raw`
     const infoUrl = new URL('/info', info.origin);
     infoUrl.searchParams.set('path', info.path);
     infoUrl.searchParams.set('sign', info.sign);
+    infoUrl.searchParams.set('retry', state.segmentRetryRaw);
     return infoUrl;
   };
 
@@ -695,6 +811,16 @@ const pageScript = String.raw`
     }
     const meta = data.meta;
     const download = data.download;
+    if (data.settings && typeof data.settings.segmentRetry === 'string') {
+      const workerRetry = data.settings.segmentRetry.trim();
+      if (workerRetry) {
+        const applied = applySegmentRetryValue(workerRetry, { notify: false, persist: true });
+        if (!applied.ok) {
+          log('来自 worker 的分段重试参数无效：' + workerRetry);
+          syncRetryInput();
+        }
+      }
+    }
     const previousMeta = state.meta;
     const previousSegments = state.segments;
 
@@ -755,6 +881,16 @@ const pageScript = String.raw`
       if (!sign) {
         throw new Error('签名缺失');
       }
+      const retryParam = currentUrl.searchParams.get('retry');
+      if (retryParam) {
+        const applied = applySegmentRetryValue(retryParam, { notify: false, persist: false });
+        if (!applied.ok) {
+          log('忽略无效的分段重试参数：' + retryParam);
+          syncRetryInput();
+        }
+      } else {
+        syncRetryInput();
+      }
       state.infoParams = {
         origin: currentUrl.origin,
         path,
@@ -774,20 +910,73 @@ const pageScript = String.raw`
     }
 
     const infoUrl = buildInfoUrl();
-    const response = await fetch(infoUrl.toString(), {
-      headers: { Accept: 'application/json' },
-    });
-    if (!response.ok) {
-      throw new Error('获取信息失败，HTTP ' + response.status);
+    let retries = 0;
+    while (true) {
+      try {
+        const response = await fetch(infoUrl.toString(), {
+          headers: { Accept: 'application/json' },
+        });
+        if (!response.ok) {
+          const status = response.status;
+          let messageText = '';
+          try {
+            const rawText = await response.text();
+            if (rawText) {
+              try {
+                const parsed = JSON.parse(rawText);
+                if (parsed && parsed.message) {
+                  messageText = String(parsed.message);
+                } else {
+                  messageText = rawText.trim();
+                }
+              } catch (parseError) {
+                messageText = rawText.trim();
+              }
+            }
+          } catch (readError) {
+            console.warn('读取 /info 错误响应失败', readError);
+          }
+          const cleaned = messageText ? messageText.trim() : '';
+          const finalMessage = cleaned
+            ? cleaned + '（HTTP ' + status + '）'
+            : '获取信息失败，HTTP ' + status;
+          const fatal = new Error(finalMessage);
+          if (status === 410) {
+            markNonRetryable(fatal, 'http410');
+          }
+          throw fatal;
+        }
+        const payload = await response.json();
+        if (payload.code !== 200 || !payload.data) {
+          const finalMessage = payload.message || '接口返回异常';
+          const fatal = new Error(finalMessage);
+          if (payload.code === 410) {
+            markNonRetryable(fatal, 'code410');
+          }
+          throw fatal;
+        }
+        const data = payload.data;
+        applyInfo(data);
+        saveInfoToCache(data);
+        return data;
+      } catch (error) {
+        const limit = state.segmentRetryLimit;
+        const message = error instanceof Error && error.message ? error.message : String(error);
+        if (error && error.retryable === false) {
+          setStatus('/info 请求失败：' + message + '（不再重试）');
+          throw error;
+        }
+        if (Number.isFinite(limit) && retries >= limit) {
+          throw new Error('/info 请求失败已达重试上限：' + message);
+        }
+        retries += 1;
+        const retryLabel = Number.isFinite(limit)
+          ? '第 ' + retries + ' 次重试（共 ' + limit + ' 次）'
+          : '第 ' + retries + ' 次重试（无限重试）';
+        setStatus('/info 请求失败：' + message + '，' + Math.round(RETRY_DELAY_MS / 1000) + ' 秒后重试，' + retryLabel + '。');
+        await sleep(RETRY_DELAY_MS);
+      }
     }
-    const payload = await response.json();
-    if (payload.code !== 200 || !payload.data) {
-      throw new Error(payload.message || '接口返回异常');
-    }
-    const data = payload.data;
-    applyInfo(data);
-    saveInfoToCache(data);
-    return data;
   };
 
   const refreshInfoAfterCleanup = async ({ clearSegments = false } = {}) => {
@@ -876,7 +1065,13 @@ const pageScript = String.raw`
         signal: controller.signal,
       });
       if (!(response.ok || response.status === 206)) {
-        throw new Error('远程响应状态 ' + response.status);
+        const status = response.status;
+        const baseMessage = '远程响应状态 ' + status;
+        if (status === 410) {
+          const fatal = markNonRetryable(new Error('远程签名已过期或失效（HTTP 410），请重新生成链接'));
+          throw fatal;
+        }
+        throw new Error(baseMessage);
       }
       const reader = response.body && response.body.getReader ? response.body.getReader() : null;
       if (reader) {
@@ -946,10 +1141,19 @@ const pageScript = String.raw`
             return;
           }
           const message = error instanceof Error && error.message ? error.message : '未知错误';
+          if (error && error.retryable === false) {
+            setStatus('分段 #' + (index + 1) + ' 下载失败：' + message + '（不再重试）');
+            throw error;
+          }
           segment.retries += 1;
-          if (segment.retries <= MAX_RETRY_PER_SEGMENT) {
+          const retryLimit = state.segmentRetryLimit;
+          const shouldRetry = Number.isFinite(retryLimit) ? segment.retries <= retryLimit : true;
+          if (shouldRetry) {
             const attempt = segment.retries;
-            setStatus('分段 #' + (index + 1) + ' 下载失败：' + message + '，' + Math.round(RETRY_DELAY_MS / 1000) + ' 秒后重试（' + attempt + '/' + MAX_RETRY_PER_SEGMENT + '）');
+            const retryLabel = Number.isFinite(retryLimit)
+              ? '第 ' + attempt + ' 次重试（共 ' + retryLimit + ' 次）'
+              : '第 ' + attempt + ' 次重试（无限重试）';
+            setStatus('分段 #' + (index + 1) + ' 下载失败：' + message + '，' + Math.round(RETRY_DELAY_MS / 1000) + ' 秒后重试，' + retryLabel + '。');
             await sleep(RETRY_DELAY_MS);
             enqueueSegment(index, true);
             return;
@@ -1165,6 +1369,63 @@ const decryptSegment = async (segment) => {
     await state.workflowPromise;
   };
 
+  if (advancedToggleBtn) {
+    advancedToggleBtn.addEventListener('click', () => {
+      if (advancedToggleBtn.disabled) return;
+      if (state.advancedOpen) {
+        closeAdvancedPanel({ restoreFocus: false });
+      } else {
+        openAdvancedPanel();
+      }
+    });
+  }
+
+  if (advancedCloseBtn) {
+    advancedCloseBtn.addEventListener('click', () => {
+      closeAdvancedPanel({ restoreFocus: true });
+    });
+  }
+
+  if (advancedBackdrop) {
+    advancedBackdrop.addEventListener('click', () => {
+      closeAdvancedPanel({ restoreFocus: true });
+    });
+  }
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && state.advancedOpen) {
+      closeAdvancedPanel({ restoreFocus: true });
+    }
+  });
+
+  const handleRetryInputCommit = () => {
+    if (!retryLimitInput) return;
+    const rawInput = retryLimitInput.value || '';
+    const trimmed = rawInput.trim();
+    if (trimmed.toLowerCase() === state.segmentRetryRaw.toLowerCase()) {
+      syncRetryInput();
+      return;
+    }
+    const result = applySegmentRetryValue(trimmed, { notify: true });
+    if (!result.ok) {
+      setStatus('分段重试次数无效，请输入正整数或 inf（无限重试）。');
+      syncRetryInput();
+      retryLimitInput.focus({ preventScroll: true });
+    }
+  };
+
+  if (retryLimitInput) {
+    retryLimitInput.addEventListener('change', handleRetryInputCommit);
+    retryLimitInput.addEventListener('blur', handleRetryInputCommit);
+    retryLimitInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        handleRetryInputCommit();
+        retryLimitInput.blur();
+      }
+    });
+  }
+
 toggleBtn.addEventListener('click', () => {
     if (!state.infoReady) return;
     if (!state.started) {
@@ -1314,6 +1575,7 @@ const renderLandingPageHtml = (path) => {
       }
       .controls {
         display: flex;
+        flex-wrap: wrap;
         gap: 0.5rem;
         margin: 1.5rem 0;
       }
@@ -1336,6 +1598,113 @@ const renderLandingPageHtml = (path) => {
         opacity: 0.5;
         cursor: not-allowed;
       }
+      .controls button.secondary {
+        background: rgba(148,163,184,0.16);
+        color: #e2e8f0;
+      }
+      .controls button.secondary:hover:not(:disabled) {
+        background: rgba(148,163,184,0.28);
+      }
+      .advanced-panel {
+        position: fixed;
+        top: 0;
+        right: 0;
+        transform: translateX(100%);
+        width: 320px;
+        max-width: 90vw;
+        height: 100%;
+        z-index: 30;
+        background: rgba(15,23,42,0.95);
+        border-left: 1px solid rgba(148,163,184,0.16);
+        box-shadow: -16px 0 32px rgba(15,23,42,0.5);
+        backdrop-filter: blur(6px);
+        transition: transform 0.3s ease;
+        display: flex;
+        flex-direction: column;
+        padding: 1.5rem 1.25rem;
+      }
+      .advanced-panel.is-open {
+        transform: translateX(0);
+      }
+      .advanced-panel[aria-hidden="true"] {
+        pointer-events: none;
+      }
+      .advanced-backdrop {
+        position: fixed;
+        inset: 0;
+        background: rgba(15,23,42,0.55);
+        backdrop-filter: blur(2px);
+        z-index: 20;
+      }
+      .advanced-backdrop[hidden] {
+        display: none;
+      }
+      .advanced-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 1rem;
+      }
+      .advanced-header h2 {
+        margin: 0;
+        font-size: 1.1rem;
+        color: #f8fafc;
+      }
+      .advanced-close {
+        background: transparent;
+        border: none;
+        color: #94a3b8;
+        font-size: 0.9rem;
+        padding: 0.35rem 0.75rem;
+        border-radius: 999px;
+        cursor: pointer;
+        transition: color 0.2s ease, background 0.2s ease;
+      }
+      .advanced-close:hover {
+        color: #f8fafc;
+        background: rgba(148,163,184,0.14);
+      }
+      .advanced-body {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        gap: 1.25rem;
+        overflow-y: auto;
+      }
+      .retry-label {
+        display: flex;
+        flex-direction: column;
+        gap: 0.35rem;
+        font-size: 0.95rem;
+        color: #e0f2fe;
+      }
+      .retry-hint {
+        font-size: 0.8rem;
+        color: #94a3b8;
+      }
+      .retry-input {
+        background: rgba(15,23,42,0.85);
+        border: 1px solid rgba(148,163,184,0.3);
+        border-radius: 0.5rem;
+        padding: 0.6rem 0.75rem;
+        color: #f1f5f9;
+        font-size: 0.95rem;
+        transition: border-color 0.2s ease, box-shadow 0.2s ease;
+      }
+      .retry-input:focus {
+        outline: none;
+        border-color: rgba(56,189,248,0.6);
+        box-shadow: 0 0 0 2px rgba(56,189,248,0.2);
+      }
+      .advanced-actions {
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+        margin-top: auto;
+      }
+      .advanced-actions button {
+        width: 100%;
+      }
       .log {
         background: rgba(15,23,42,0.6);
         border-radius: 0.75rem;
@@ -1357,6 +1726,10 @@ const renderLandingPageHtml = (path) => {
         }
         button {
           width: 100%;
+        }
+        .advanced-panel {
+          width: 100%;
+          padding: 1.25rem;
         }
       }
     </style>
@@ -1382,9 +1755,26 @@ const renderLandingPageHtml = (path) => {
       <div class="controls">
         <button id="toggleBtn" disabled>加载中</button>
         <button id="retryBtn" disabled>重试</button>
-        <button id="clearCacheBtn" disabled>清理缓存</button>
-        <button id="clearEnvBtn" disabled>清理环境</button>
+        <button id="advancedToggle" class="secondary" type="button">高级选项</button>
       </div>
+      <aside id="advancedPanel" class="advanced-panel" aria-hidden="true">
+        <div class="advanced-header">
+          <h2>高级选项</h2>
+          <button id="advancedCloseBtn" type="button" class="advanced-close">关闭</button>
+        </div>
+        <div class="advanced-body">
+          <label class="retry-label" for="retryLimitInput">
+            分段重试次数
+            <span class="retry-hint">支持正整数或 inf（无限重试）</span>
+          </label>
+          <input id="retryLimitInput" class="retry-input" type="text" inputmode="numeric" autocomplete="off" value="10">
+          <div class="advanced-actions">
+            <button id="clearCacheBtn" disabled>清理缓存</button>
+            <button id="clearEnvBtn" disabled>清理环境</button>
+          </div>
+        </div>
+      </aside>
+      <div id="advancedBackdrop" class="advanced-backdrop" hidden></div>
       <section>
         <div class="label">事件日志</div>
         <div class="log" id="log"></div>
