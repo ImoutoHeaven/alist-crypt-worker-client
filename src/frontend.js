@@ -25,6 +25,8 @@ const pageScript = String.raw`
   const speedText = $('speedText');
   const toggleBtn = $('toggleBtn');
   const retryBtn = $('retryBtn');
+  const clearCacheBtn = $('clearCacheBtn');
+  const clearEnvBtn = $('clearEnvBtn');
   const logEl = $('log');
 
   const log = (message) => {
@@ -137,11 +139,135 @@ const pageScript = String.raw`
     bytesSinceSpeedCheck: 0,
     lastSpeedAt: performance.now(),
     writer: null,
+    writerHandle: null,
+    writerKey: '',
     workflowPromise: null,
   };
 
   const STORAGE_PREFIX = 'alist-crypt-info::';
   const STORAGE_VERSION = 1;
+  const WRITER_DB_NAME = 'alist-crypt-writer';
+  const WRITER_DB_VERSION = 1;
+  const WRITER_STORE_NAME = 'handles';
+
+  const openWriterDatabase = () =>
+    new Promise((resolve, reject) => {
+      if (typeof window === 'undefined' || !window.indexedDB) {
+        reject(new Error('当前环境不支持 IndexedDB'));
+        return;
+      }
+      const request = window.indexedDB.open(WRITER_DB_NAME, WRITER_DB_VERSION);
+      request.onerror = () => reject(request.error || new Error('打开文件句柄数据库失败'));
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(WRITER_STORE_NAME)) {
+          db.createObjectStore(WRITER_STORE_NAME);
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+    });
+
+  const runWriterStore = async (mode, executor) => {
+    try {
+      const db = await openWriterDatabase();
+      return await new Promise((resolve, reject) => {
+        let settled = false;
+        const tx = db.transaction(WRITER_STORE_NAME, mode);
+        const store = tx.objectStore(WRITER_STORE_NAME);
+        const request = executor(store);
+        request.onsuccess = () => {
+          settled = true;
+          resolve(request.result);
+        };
+        request.onerror = () => {
+          settled = true;
+          reject(request.error || new Error('访问文件句柄存储失败'));
+        };
+        tx.oncomplete = () => {
+          if (!settled) resolve(undefined);
+          db.close();
+        };
+        tx.onabort = () => {
+          const reason = tx.error || new Error('文件句柄事务被中止');
+          if (!settled) reject(reason);
+          db.close();
+        };
+        tx.onerror = () => {
+          const reason = tx.error || new Error('文件句柄事务失败');
+          if (!settled) reject(reason);
+          db.close();
+        };
+      });
+    } catch (error) {
+      console.warn('访问文件句柄存储时发生异常', error);
+      return undefined;
+    }
+  };
+
+  const saveWriterHandle = async (key, handle) => {
+    if (!key || !handle || typeof window === 'undefined' || !window.indexedDB) return;
+    await runWriterStore('readwrite', (store) => store.put(handle, key));
+  };
+
+  const loadWriterHandle = async (key) => {
+    if (!key || typeof window === 'undefined' || !window.indexedDB) return null;
+    const handle = await runWriterStore('readonly', (store) => store.get(key));
+    return handle || null;
+  };
+
+  const deleteWriterHandle = async (key) => {
+    if (!key || typeof window === 'undefined' || !window.indexedDB) return;
+    await runWriterStore('readwrite', (store) => store.delete(key));
+  };
+
+  const ensureHandlePermission = async (handle) => {
+    if (!handle) return false;
+    const ensure = async (mode) => {
+      if (typeof handle.queryPermission === 'function') {
+        const status = await handle.queryPermission({ mode });
+        if (status === 'granted') return true;
+        if (status === 'prompt' && typeof handle.requestPermission === 'function') {
+          const granted = await handle.requestPermission({ mode });
+          return granted === 'granted';
+        }
+        if (status === 'denied' && typeof handle.requestPermission === 'function') {
+          const granted = await handle.requestPermission({ mode });
+          return granted === 'granted';
+        }
+        return status === 'granted';
+      }
+      if (typeof handle.requestPermission === 'function') {
+        const granted = await handle.requestPermission({ mode });
+        return granted === 'granted';
+      }
+      return true;
+    };
+    try {
+      return await ensure('readwrite');
+    } catch (error) {
+      console.warn('文件权限请求失败', error);
+      return false;
+    }
+  };
+
+  const getPersistedWriterHandle = async (key) => {
+    if (!key || typeof window === 'undefined') return null;
+    if (state.writerHandle && state.writerKey === key) {
+      if (await ensureHandlePermission(state.writerHandle)) {
+        return state.writerHandle;
+      }
+    }
+    const stored = await loadWriterHandle(key);
+    if (!stored) return null;
+    const allowed = await ensureHandlePermission(stored);
+    if (!allowed) {
+      await deleteWriterHandle(key);
+      return null;
+    }
+    state.writerHandle = stored;
+    state.writerKey = key;
+    return stored;
+  };
 
   const getCacheKey = () => {
     if (state.cacheKey) return state.cacheKey;
@@ -236,6 +362,43 @@ const pageScript = String.raw`
     toggleBtn.textContent = '处理中';
   };
 
+  const clearDownloadEnvironment = async () => {
+    if (state.speedTimer) {
+      clearInterval(state.speedTimer);
+      state.speedTimer = null;
+    }
+    state.segments.forEach((segment) => {
+      if (segment.controller) {
+        try {
+          segment.controller.abort();
+        } catch (error) {
+          console.warn('终止分段请求失败', error);
+        }
+      }
+      segment.encrypted = null;
+    });
+    state.segments = [];
+    state.pendingSegments = [];
+    state.total = 0;
+    state.totalEncrypted = 0;
+    state.downloadedEncrypted = 0;
+    state.decrypted = 0;
+    state.resumeResolvers.splice(0, state.resumeResolvers.length).forEach((resolve) => resolve());
+    state.workflowPromise = null;
+    state.started = false;
+    state.paused = false;
+    state.mode = 'idle';
+    state.infoReady = false;
+    state.cacheHit = false;
+    state.meta = null;
+    state.remote = null;
+    state.dataKey = null;
+    state.baseNonce = null;
+    await releaseCurrentWriter();
+    resetProgressBars();
+    updateToggleLabel();
+  };
+
   const waitWhilePaused = async () => {
     while (state.paused) {
       await waitForResume();
@@ -252,16 +415,81 @@ const pageScript = String.raw`
     speedText.textContent = speed > 0 ? formatBytes(speed) + '/s' : '--';
   };
 
+  const releaseCurrentWriter = async () => {
+    if (!state.writer) return;
+    if (state.writer.type === 'fs' && state.writer.writable && typeof state.writer.writable.close === 'function') {
+      try {
+        await state.writer.writable.close();
+      } catch (error) {
+        console.warn('关闭文件写入器失败', error);
+      }
+    }
+    if (state.writer.type === 'memory' && state.writer.chunks) {
+      state.writer.chunks = [];
+    }
+    state.writer = null;
+  };
+
   const ensureWriter = async (fileName) => {
+    await releaseCurrentWriter();
     if ('showSaveFilePicker' in window) {
+      const key = getCacheKey();
       const suggestedName = fileName && fileName.trim() !== '' ? fileName : 'download.bin';
-      const handle = await window.showSaveFilePicker({
-        suggestedName,
-        types: [{ description: 'Binary file', accept: { 'application/octet-stream': ['.bin'] } }],
-      });
-      const writable = await handle.createWritable();
+      let handle = null;
+      let reused = false;
+      if (key) {
+        handle = await getPersistedWriterHandle(key);
+        reused = !!handle;
+      }
+      if (!handle) {
+        try {
+          handle = await window.showSaveFilePicker({
+            suggestedName,
+            types: [{ description: 'Binary file', accept: { 'application/octet-stream': ['.bin'] } }],
+          });
+        } catch (error) {
+          throw new Error('已取消选择保存位置');
+        }
+      }
+      const granted = await ensureHandlePermission(handle);
+      if (!granted) {
+        if (key) await deleteWriterHandle(key);
+        throw new Error('未授予文件写入权限');
+      }
+      let writable;
+      try {
+        writable = await handle.createWritable({ keepExistingData: false });
+      } catch (error) {
+        console.warn('使用已保存的文件句柄失败', error);
+        if (!reused) throw error;
+        if (key) await deleteWriterHandle(key);
+        try {
+          handle = await window.showSaveFilePicker({
+            suggestedName,
+            types: [{ description: 'Binary file', accept: { 'application/octet-stream': ['.bin'] } }],
+          });
+        } catch (retryError) {
+          throw new Error('无法重新选择保存位置');
+        }
+        const retryGranted = await ensureHandlePermission(handle);
+        if (!retryGranted) {
+          throw new Error('未授予文件写入权限');
+        }
+        writable = await handle.createWritable({ keepExistingData: false });
+        reused = false;
+      }
       state.writer = { type: 'fs', writable };
-      log('已选择保存位置：' + suggestedName);
+      state.writerHandle = handle;
+      state.writerKey = key || '';
+      if (key) {
+        await saveWriterHandle(key, handle);
+      }
+      const handleName = handle && handle.name ? handle.name : suggestedName;
+      if (reused) {
+        log('已复用上次保存的位置：' + handleName);
+      } else {
+        log('已选择保存位置：' + handleName);
+      }
       return;
     }
     state.writer = { type: 'memory', chunks: [] };
@@ -281,6 +509,7 @@ const pageScript = String.raw`
     if (!state.writer) return;
     if (state.writer.type === 'fs') {
       await state.writer.writable.close();
+      state.writer = null;
       log('文件已保存到指定位置');
       return;
     }
@@ -293,6 +522,7 @@ const pageScript = String.raw`
     anchor.click();
     document.body.removeChild(anchor);
     setTimeout(() => URL.revokeObjectURL(url), 1000);
+    state.writer = null;
     log('已触发浏览器下载');
   };
 
@@ -488,6 +718,11 @@ const pageScript = String.raw`
     state.writer = null;
     state.workflowPromise = null;
     state.cacheHit = fromCache;
+    const nextWriterKey = getCacheKey();
+    if (state.writerKey && state.writerKey !== nextWriterKey) {
+      state.writerHandle = null;
+    }
+    state.writerKey = nextWriterKey;
 
     prepareSegments();
     resetProgressBars();
@@ -498,6 +733,8 @@ const pageScript = String.raw`
     updateToggleLabel();
     toggleBtn.disabled = false;
     retryBtn.disabled = true;
+    clearCacheBtn.disabled = false;
+    clearEnvBtn.disabled = false;
     logEl.innerHTML = '';
     const statusMessage = fromCache
       ? '已从缓存恢复下载信息，随时可以开始下载。'
@@ -551,6 +788,54 @@ const pageScript = String.raw`
     applyInfo(data);
     saveInfoToCache(data);
     return data;
+  };
+
+  const refreshInfoAfterCleanup = async ({ clearSegments = false } = {}) => {
+    if (!state.infoParams && !state.infoReady) {
+      setStatus('尚未初始化，请稍后再试');
+      return;
+    }
+    if (state.workflowPromise) {
+      setStatus('当前流程正在进行，请稍后重试');
+      log('忽略清理请求：流程正在进行');
+      return;
+    }
+    const actionKey = clearSegments ? '环境' : '缓存';
+    const actionLabel = '清理' + actionKey;
+    toggleBtn.disabled = true;
+    toggleBtn.textContent = '加载中';
+    retryBtn.disabled = true;
+    clearCacheBtn.disabled = true;
+    clearEnvBtn.disabled = true;
+    state.infoReady = false;
+    setStatus(actionLabel + '中，请稍候...');
+    log(actionLabel + '操作开始');
+
+    if (clearSegments) {
+      await clearDownloadEnvironment();
+      log('本地分段数据已清理');
+    }
+
+    clearInfoCache();
+    log('本地缓存的 /info 信息已清理');
+    setStatus('正在重新获取最新的下载信息...');
+    try {
+      await fetchInfo({ initial: true, forceRefresh: true });
+      log('已重新获取 /info 信息并完成缓存');
+      setStatus(actionLabel + '完成，信息已刷新，可开始下载。');
+      toggleBtn.disabled = false;
+      clearCacheBtn.disabled = false;
+      clearEnvBtn.disabled = false;
+    } catch (error) {
+      console.error(error);
+      setStatus(actionLabel + '后重新获取信息失败：' + error.message);
+      toggleBtn.disabled = false;
+      toggleBtn.textContent = '开始下载';
+      retryBtn.disabled = false;
+      clearCacheBtn.disabled = false;
+      clearEnvBtn.disabled = false;
+      return;
+    }
   };
 
   const buildRemoteHeaders = () => {
@@ -797,7 +1082,7 @@ const decryptSegment = async (segment) => {
     }
   };
 
-    const startWorkflow = async () => {
+  const startWorkflow = async () => {
     if (state.workflowPromise) return;
     state.workflowPromise = (async () => {
       try {
@@ -814,6 +1099,8 @@ const decryptSegment = async (segment) => {
         updateToggleLabel();
         toggleBtn.disabled = false;
         retryBtn.disabled = true;
+        clearCacheBtn.disabled = true;
+        clearEnvBtn.disabled = true;
         setStatus('开始下载，目标速率 ' + REQUESTS_PER_SECOND + ' 请求/秒');
         if (state.speedTimer) {
           clearInterval(state.speedTimer);
@@ -850,6 +1137,8 @@ const decryptSegment = async (segment) => {
           state.started = false;
           state.mode = 'idle';
           updateToggleLabel();
+          clearCacheBtn.disabled = false;
+          clearEnvBtn.disabled = false;
         } else {
           setStatus('流程失败：发生未知错误');
           retryBtn.disabled = false;
@@ -858,11 +1147,17 @@ const decryptSegment = async (segment) => {
           state.started = false;
           state.mode = 'idle';
           updateToggleLabel();
+          clearCacheBtn.disabled = false;
+          clearEnvBtn.disabled = false;
         }
       } finally {
         if (state.speedTimer) {
           clearInterval(state.speedTimer);
           state.speedTimer = null;
+        }
+        if (state.infoReady) {
+          clearCacheBtn.disabled = false;
+          clearEnvBtn.disabled = false;
         }
         state.workflowPromise = null;
       }
@@ -881,14 +1176,45 @@ toggleBtn.addEventListener('click', () => {
     }
   });
 
-    retryBtn.addEventListener('click', () => {
+  retryBtn.addEventListener('click', async () => {
     if (state.workflowPromise) return;
     toggleBtn.disabled = true;
     toggleBtn.textContent = '加载中';
     retryBtn.disabled = true;
-    fetchInfo({ initial: true, forceRefresh: true }).catch((error) => {
+    clearCacheBtn.disabled = true;
+    clearEnvBtn.disabled = true;
+    try {
+      await fetchInfo({ initial: true, forceRefresh: true });
+      startWorkflow();
+    } catch (error) {
       console.error(error);
       setStatus('重新获取信息失败：' + error.message);
+      toggleBtn.disabled = false;
+      toggleBtn.textContent = '开始下载';
+      retryBtn.disabled = false;
+      clearCacheBtn.disabled = false;
+      clearEnvBtn.disabled = false;
+    }
+  });
+
+  clearCacheBtn.addEventListener('click', () => {
+    refreshInfoAfterCleanup({ clearSegments: false }).catch((error) => {
+      console.error(error);
+      setStatus('清理缓存失败：' + (error && error.message ? error.message : '未知错误'));
+      clearCacheBtn.disabled = false;
+      clearEnvBtn.disabled = false;
+      toggleBtn.disabled = false;
+      toggleBtn.textContent = '开始下载';
+      retryBtn.disabled = false;
+    });
+  });
+
+  clearEnvBtn.addEventListener('click', () => {
+    refreshInfoAfterCleanup({ clearSegments: true }).catch((error) => {
+      console.error(error);
+      setStatus('清理环境失败：' + (error && error.message ? error.message : '未知错误'));
+      clearCacheBtn.disabled = false;
+      clearEnvBtn.disabled = false;
       toggleBtn.disabled = false;
       toggleBtn.textContent = '开始下载';
       retryBtn.disabled = false;
@@ -899,6 +1225,8 @@ toggleBtn.addEventListener('click', () => {
     toggleBtn.disabled = true;
     toggleBtn.textContent = '加载中';
     retryBtn.disabled = true;
+    clearCacheBtn.disabled = true;
+    clearEnvBtn.disabled = true;
     try {
       await fetchInfo({ initial: true });
     } catch (error) {
@@ -1054,6 +1382,8 @@ const renderLandingPageHtml = (path) => {
       <div class="controls">
         <button id="toggleBtn" disabled>加载中</button>
         <button id="retryBtn" disabled>重试</button>
+        <button id="clearCacheBtn" disabled>清理缓存</button>
+        <button id="clearEnvBtn" disabled>清理环境</button>
       </div>
       <section>
         <div class="label">事件日志</div>
