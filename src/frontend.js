@@ -16,6 +16,10 @@ const pageScript = String.raw`
   const INFINITE_RETRY_TOKEN = 'inf';
   const RETRY_DELAY_MS = 20000;
   const SEGMENT_SIZE_BYTES = 32 * 1024 * 1024;
+  const DEFAULT_PARALLEL_THREADS = 6;
+  const MIN_PARALLEL_THREADS = 1;
+  const MAX_PARALLEL_THREADS = 32;
+  const PARALLEL_STORAGE_KEY = 'alist-crypt-parallelism';
   const $ = (id) => document.getElementById(id);
   const statusEl = $('status');
   const fileNameEl = $('fileName');
@@ -31,6 +35,7 @@ const pageScript = String.raw`
   const advancedBackdrop = $('advancedBackdrop');
   const advancedCloseBtn = $('advancedCloseBtn');
   const retryLimitInput = $('retryLimitInput');
+  const parallelLimitInput = $('parallelLimitInput');
   const clearCacheBtn = $('clearCacheBtn');
   const clearEnvBtn = $('clearEnvBtn');
   const logEl = $('log');
@@ -144,6 +149,8 @@ const pageScript = String.raw`
     baseNonce: null,
     segmentRetryLimit: DEFAULT_SEGMENT_RETRY_LIMIT,
     segmentRetryRaw: String(DEFAULT_SEGMENT_RETRY_LIMIT),
+    decryptParallelism: DEFAULT_PARALLEL_THREADS,
+    decryptParallelRaw: String(DEFAULT_PARALLEL_THREADS),
     advancedOpen: false,
     segments: [],
     pendingSegments: [],
@@ -189,6 +196,57 @@ const pageScript = String.raw`
     if (retryLimitInput) {
       retryLimitInput.value = state.segmentRetryRaw;
     }
+  };
+
+  const syncParallelInput = () => {
+    if (parallelLimitInput) {
+      parallelLimitInput.value = state.decryptParallelRaw;
+    }
+  };
+
+  const loadParallelSetting = () => {
+    if (typeof window === 'undefined' || !window.localStorage) return null;
+    try {
+      const stored = window.localStorage.getItem(PARALLEL_STORAGE_KEY);
+      if (!stored) return null;
+      const parsed = Number.parseInt(stored, 10);
+      if (!Number.isFinite(parsed)) return null;
+      if (parsed < MIN_PARALLEL_THREADS || parsed > MAX_PARALLEL_THREADS) return null;
+      return parsed;
+    } catch (error) {
+      console.warn('读取并行解密设置失败', error);
+      return null;
+    }
+  };
+
+  const persistParallelSetting = (rawValue) => {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    try {
+      window.localStorage.setItem(PARALLEL_STORAGE_KEY, rawValue);
+    } catch (error) {
+      console.warn('保存并行解密设置失败', error);
+    }
+  };
+
+  const applyParallelValue = (inputValue, { notify = false, persist = true } = {}) => {
+    const rawInput = typeof inputValue === 'string' ? inputValue.trim() : '';
+    if (!rawInput) {
+      return { ok: false, reason: 'empty' };
+    }
+    const parsed = Number.parseInt(rawInput, 10);
+    if (!Number.isFinite(parsed) || parsed < MIN_PARALLEL_THREADS || parsed > MAX_PARALLEL_THREADS) {
+      return { ok: false, reason: 'invalid' };
+    }
+    state.decryptParallelism = parsed;
+    state.decryptParallelRaw = String(parsed);
+    syncParallelInput();
+    if (persist) {
+      persistParallelSetting(state.decryptParallelRaw);
+    }
+    if (notify) {
+      log('并行解密线程数已更新为 ' + parsed + ' 条线程');
+    }
+    return { ok: true, limit: parsed, raw: state.decryptParallelRaw };
   };
 
   const syncAdvancedPanel = () => {
@@ -252,12 +310,19 @@ const pageScript = String.raw`
     return { ok: true, limit, raw };
   };
 
+  const storedParallel = loadParallelSetting();
+  if (Number.isFinite(storedParallel)) {
+    state.decryptParallelism = storedParallel;
+    state.decryptParallelRaw = String(storedParallel);
+  }
+
   if (advancedToggleBtn) {
     advancedToggleBtn.setAttribute('aria-controls', 'advancedPanel');
     advancedToggleBtn.setAttribute('aria-expanded', 'false');
   }
   syncAdvancedPanel();
   syncRetryInput();
+  syncParallelInput();
 
   const STORAGE_PREFIX = 'alist-crypt-info::';
   const STORAGE_VERSION = 1;
@@ -1208,8 +1273,14 @@ const pageScript = String.raw`
     }
   };
 
-const decryptSegment = async (segment) => {
-    if (!segment.encrypted) {
+  const shouldYieldForProgress = (value) =>
+    Number.isFinite(state.blockDataSize) &&
+    state.blockDataSize > 0 &&
+    value > 0 &&
+    value % (state.blockDataSize * 4) === 0;
+
+  const decryptSegmentData = async (segment) => {
+    if (!segment || !segment.encrypted) {
       throw new Error('缺少加密数据');
     }
     const buffer = segment.encrypted;
@@ -1220,6 +1291,7 @@ const decryptSegment = async (segment) => {
     let currentBlock = segment.mapping.blocks;
     let discard = segment.mapping.discard;
     let offset = 0;
+    const output = new Uint8Array(totalNeeded);
 
     while (offset < buffer.length && produced < totalNeeded) {
       if (state.paused) {
@@ -1257,32 +1329,111 @@ const decryptSegment = async (segment) => {
         break;
       }
       if (chunk.length > remaining) {
-        const slice = chunk.subarray(0, remaining);
-        await writeChunk(slice);
-        produced += slice.length;
-        state.decrypted += slice.length;
+        output.set(chunk.subarray(0, remaining), produced);
+        produced += remaining;
         break;
       }
-      await writeChunk(chunk);
+      output.set(chunk, produced);
       produced += chunk.length;
-      state.decrypted += chunk.length;
       currentBlock += 1;
-      if (state.decrypted % (state.blockDataSize * 4) === 0) {
-        updateProgress();
+      if (shouldYieldForProgress(produced)) {
         await new Promise((resolve) => setTimeout(resolve, 0));
       }
     }
+
+    if (produced !== totalNeeded) {
+      throw new Error('解密输出长度不匹配');
+    }
     segment.encrypted = null;
-    updateProgress();
+    return output;
   };
 
-  const decryptAllSegments = async () => {
+  const clampParallelThreads = (value) => {
+    if (!Number.isFinite(value)) {
+      return DEFAULT_PARALLEL_THREADS;
+    }
+    const rounded = Math.max(MIN_PARALLEL_THREADS, Math.floor(value));
+    return Math.min(MAX_PARALLEL_THREADS, rounded);
+  };
+
+  const resolveParallelism = () => {
+    const configured = clampParallelThreads(
+      Number.isFinite(state.decryptParallelism) ? state.decryptParallelism : DEFAULT_PARALLEL_THREADS,
+    );
+    if (typeof navigator !== 'undefined' && navigator && Number.isFinite(navigator.hardwareConcurrency)) {
+      const hardwareClamped = clampParallelThreads(navigator.hardwareConcurrency);
+      return Math.max(MIN_PARALLEL_THREADS, Math.min(configured, hardwareClamped));
+    }
+    return configured;
+  };
+
+  const decryptAllSegments = async (requestedThreads) => {
     setStatus('下载完成，准备解密');
-    for (const segment of state.segments) {
-      if (state.paused) {
-        await waitWhilePaused();
+    const requested = Number.isFinite(requestedThreads) ? requestedThreads : resolveParallelism();
+    const parallelism = clampParallelThreads(requested);
+    const totalSegments = state.segments.length;
+    if (totalSegments === 0) {
+      return;
+    }
+    let nextToAssign = 0;
+    let nextToWrite = 0;
+    const pendingResults = new Map();
+    let flushChain = Promise.resolve();
+    let flushError = null;
+
+    const scheduleFlush = () => {
+      flushChain = flushChain
+        .then(async () => {
+          while (pendingResults.has(nextToWrite)) {
+            const data = pendingResults.get(nextToWrite);
+            pendingResults.delete(nextToWrite);
+            await writeChunk(data);
+            state.decrypted = Math.min(state.total, state.decrypted + data.length);
+            nextToWrite += 1;
+            updateProgress();
+            if (shouldYieldForProgress(state.decrypted) || state.decrypted === state.total) {
+              await new Promise((resolve) => setTimeout(resolve, 0));
+            }
+          }
+        })
+        .catch((error) => {
+          flushError = error instanceof Error ? error : new Error(String(error));
+          throw flushError;
+        });
+    };
+
+    const worker = async () => {
+      while (true) {
+        if (flushError) {
+          throw flushError;
+        }
+        if (state.paused) {
+          await waitWhilePaused();
+        }
+        const currentIndex = nextToAssign;
+        if (currentIndex >= totalSegments) {
+          break;
+        }
+        nextToAssign += 1;
+        const segment = state.segments[currentIndex];
+        const plain = await decryptSegmentData(segment);
+        pendingResults.set(currentIndex, plain);
+        scheduleFlush();
+        if (flushError) {
+          throw flushError;
+        }
       }
-      await decryptSegment(segment);
+    };
+
+    const workerCount = Math.min(parallelism, totalSegments);
+    const workers = [];
+    for (let i = 0; i < workerCount; i += 1) {
+      workers.push(worker());
+    }
+    await Promise.all(workers);
+    await flushChain;
+    if (nextToWrite !== totalSegments) {
+      throw new Error('仍有分段未完成解密');
     }
   };
 
@@ -1320,8 +1471,21 @@ const decryptSegment = async (segment) => {
         state.paused = false;
         updateToggleLabel();
         toggleBtn.disabled = false;
-        setStatus('所有分段下载完成，开始解密');
-        await decryptAllSegments();
+        const configuredParallel = clampParallelThreads(
+          Number.isFinite(state.decryptParallelism) ? state.decryptParallelism : DEFAULT_PARALLEL_THREADS,
+        );
+        const effectiveParallel = resolveParallelism();
+        if (effectiveParallel < configuredParallel) {
+          log(
+            '浏览器可用线程数限制为 ' +
+              effectiveParallel +
+              ' 条，已从配置的 ' +
+              configuredParallel +
+              ' 条线程进行调整',
+          );
+        }
+        setStatus('所有分段下载完成，开始解密（并行 ' + effectiveParallel + ' 线程）');
+        await decryptAllSegments(effectiveParallel);
         state.decrypted = state.total;
         updateProgress();
         await finalizeWriter();
@@ -1426,7 +1590,35 @@ const decryptSegment = async (segment) => {
     });
   }
 
-toggleBtn.addEventListener('click', () => {
+  const handleParallelInputCommit = () => {
+    if (!parallelLimitInput) return;
+    const rawInput = parallelLimitInput.value || '';
+    const trimmed = rawInput.trim();
+    if (trimmed === state.decryptParallelRaw) {
+      syncParallelInput();
+      return;
+    }
+    const result = applyParallelValue(trimmed, { notify: true });
+    if (!result.ok) {
+      setStatus('并行解密线程数无效，请输入 1-32 之间的整数。');
+      syncParallelInput();
+      parallelLimitInput.focus({ preventScroll: true });
+    }
+  };
+
+  if (parallelLimitInput) {
+    parallelLimitInput.addEventListener('change', handleParallelInputCommit);
+    parallelLimitInput.addEventListener('blur', handleParallelInputCommit);
+    parallelLimitInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        handleParallelInputCommit();
+        parallelLimitInput.blur();
+      }
+    });
+  }
+
+  toggleBtn.addEventListener('click', () => {
     if (!state.infoReady) return;
     if (!state.started) {
       startWorkflow();
@@ -1771,6 +1963,11 @@ const renderLandingPageHtml = (path) => {
             <span class="retry-hint">支持正整数或 inf（无限重试）</span>
           </label>
           <input id="retryLimitInput" class="retry-input" type="text" inputmode="numeric" autocomplete="off" value="10">
+          <label class="retry-label" for="parallelLimitInput">
+            并行解密线程数
+            <span class="retry-hint">范围 1-32，默认 6</span>
+          </label>
+          <input id="parallelLimitInput" class="retry-input" type="number" inputmode="numeric" autocomplete="off" min="1" max="32" value="6">
         </div>
       </aside>
       <div id="advancedBackdrop" class="advanced-backdrop" hidden></div>
