@@ -3,22 +3,10 @@ import {
   rotLower,
   uint8ToBase64,
   parseBoolean,
-  parseInteger,
 } from './utils.js';
 import { renderLandingPage } from './frontend.js';
 
 const REQUIRED_ENV = ['ADDRESS', 'TOKEN'];
-const preservedResponseHeaders = [
-  'content-type',
-  'content-length',
-  'content-range',
-  'accept-ranges',
-  'etag',
-  'last-modified',
-  'cache-control',
-  'expires',
-  'content-disposition',
-];
 
 const hopByHopHeaders = new Set([
   'connection',
@@ -32,9 +20,6 @@ const hopByHopHeaders = new Set([
   'content-length',
   'host',
 ]);
-
-const sessionStore = new Map();
-let lastCleanup = 0;
 
 const ensureRequiredEnv = (env) => {
   REQUIRED_ENV.forEach((key) => {
@@ -52,7 +37,6 @@ const resolveConfig = (env = {}) => {
     verifyHeader: env.VERIFY_HEADER || '',
     verifySecret: env.VERIFY_SECRET || '',
     ipv4Only: parseBoolean(env.IPV4_ONLY, false),
-    sessionTtlMs: parseInteger(env.SESSION_TTL_SECONDS, 300) * 1000,
     signSecret: env.SIGN_SECRET && env.SIGN_SECRET.trim() !== '' ? env.SIGN_SECRET : env.TOKEN,
   };
 };
@@ -188,14 +172,6 @@ const toSerializableHeaderList = (headers) => {
   return entries;
 };
 
-const headersFromList = (list = []) => {
-  const headers = new Headers();
-  for (const [key, value] of list) {
-    headers.set(key, value);
-  }
-  return headers;
-};
-
 const safeHeaders = (origin) => {
   const headers = new Headers();
   if (origin) {
@@ -278,35 +254,6 @@ const fetchEncryptedHeader = async (meta, remoteHeaders) => {
   return data;
 };
 
-const cleanupSessions = (now, ttlMs) => {
-  if (now - lastCleanup < ttlMs) return;
-  for (const [key, value] of sessionStore.entries()) {
-    if (value.expires <= now) {
-      sessionStore.delete(key);
-    }
-  }
-  lastCleanup = now;
-};
-
-const storeSession = (info, ttlMs) => {
-  const now = Date.now();
-  cleanupSessions(now, ttlMs);
-  const id = crypto.randomUUID().replace(/-/g, '');
-  const expires = now + ttlMs;
-  sessionStore.set(id, { ...info, expires });
-  return { id, expires };
-};
-
-const getSession = (id) => {
-  const record = sessionStore.get(id);
-  if (!record) return null;
-  if (record.expires <= Date.now()) {
-    sessionStore.delete(id);
-    return null;
-  }
-  return record;
-};
-
 const handleOptions = (request) => new Response(null, { headers: safeHeaders(request.headers.get('Origin')) });
 
 const handleInfo = async (request, config) => {
@@ -330,29 +277,15 @@ const handleInfo = async (request, config) => {
   const headerBytes = await fetchEncryptedHeader(meta, remoteHeaders);
   const nonce = extractNonceFromHeader(headerBytes, meta.file_header_size);
 
-  const { id: sessionId, expires } = storeSession(
-    {
-      remote: {
+  const responsePayload = {
+    code: 200,
+    data: {
+      download: {
         url: meta.remote.url,
         method: meta.remote.method || 'GET',
         headers: toSerializableHeaderList(remoteHeaders),
         rawPath: meta.remote?.raw_path || '',
       },
-      path,
-    },
-    config.sessionTtlMs,
-  );
-
-  const downloadUrl = new URL(url);
-  downloadUrl.pathname = '/fetch';
-  downloadUrl.search = `session=${sessionId}`;
-
-  const responsePayload = {
-    code: 200,
-    data: {
-      session: sessionId,
-      expires: new Date(expires).toISOString(),
-      downloadUrl: downloadUrl.toString(),
       meta: {
         path,
         size: meta.size,
@@ -366,56 +299,6 @@ const handleInfo = async (request, config) => {
     },
   };
   return respondJson(origin, responsePayload, 200);
-};
-
-const handleFetch = async (request) => {
-  const origin = request.headers.get('origin') || '*';
-  const url = new URL(request.url);
-  const sessionId = url.searchParams.get('session');
-  if (!sessionId) {
-    return respondJson(origin, { code: 400, message: 'session is required' }, 400);
-  }
-  const record = getSession(sessionId);
-  if (!record) {
-    return respondJson(origin, { code: 410, message: 'session expired' }, 410);
-  }
-
-  const upstreamHeaders = headersFromList(record.remote.headers);
-  upstreamHeaders.set('Accept-Encoding', 'identity');
-  const rangeHeader = request.headers.get('Range');
-  if (rangeHeader) {
-    upstreamHeaders.set('Range', rangeHeader);
-  } else {
-    upstreamHeaders.delete('Range');
-  }
-
-  const upstreamResp = await fetch(record.remote.url, {
-    method: record.remote.method || 'GET',
-    headers: upstreamHeaders,
-    body: record.remote.method && record.remote.method !== 'GET' && record.remote.method !== 'HEAD' ? await request.arrayBuffer() : undefined,
-  });
-
-  if (!upstreamResp.ok && upstreamResp.status !== 206) {
-    const message = `upstream request failed: ${upstreamResp.status}`;
-    return respondJson(origin, { code: upstreamResp.status, message }, upstreamResp.status);
-  }
-
-  const responseHeaders = safeHeaders(origin);
-  preservedResponseHeaders.forEach((name) => {
-    const value = upstreamResp.headers.get(name);
-    if (value !== null && value !== undefined) {
-      responseHeaders.set(name, value);
-    }
-  });
-  responseHeaders.set('Access-Control-Expose-Headers', preservedResponseHeaders.join(','));
-  responseHeaders.delete('content-type');
-  responseHeaders.set('Content-Type', 'application/octet-stream');
-  responseHeaders.delete('content-disposition');
-
-  return new Response(upstreamResp.body, {
-    status: upstreamResp.status,
-    headers: responseHeaders,
-  });
 };
 
 const handleFileRequest = async (request) => {
@@ -445,9 +328,6 @@ const routeRequest = async (request, config) => {
   const pathname = new URL(request.url).pathname || '/';
   if (request.method === 'GET' && pathname === '/info') {
     return handleInfo(request, config);
-  }
-  if (request.method === 'GET' && pathname === '/fetch') {
-    return handleFetch(request);
   }
   return handleFileRequest(request);
 };

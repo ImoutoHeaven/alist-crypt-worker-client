@@ -10,11 +10,11 @@ const pageScript = String.raw`
 (() => {
   'use strict';
 
-  const MAX_CONCURRENCY = 4;
+  const REQUESTS_PER_SECOND = 4;
+  const REQUEST_INTERVAL_MS = Math.floor(1000 / REQUESTS_PER_SECOND);
   const MAX_RETRY_PER_SEGMENT = 3;
   const RETRY_DELAY_MS = 20000;
-  const SESSION_EXPIRED_CODE = 'session-expired';
-
+  const SEGMENT_SIZE_BYTES = 32 * 1024 * 1024;
   const $ = (id) => document.getElementById(id);
   const statusEl = $('status');
   const fileNameEl = $('fileName');
@@ -113,10 +113,10 @@ const pageScript = String.raw`
 
   const state = {
     infoParams: null,
-    refreshingSession: null,
     meta: null,
-    session: null,
-    downloadUrl: '',
+    remote: null,
+    cacheKey: '',
+    cacheHit: false,
     total: 0,
     totalEncrypted: 0,
     blockDataSize: 0,
@@ -138,6 +138,59 @@ const pageScript = String.raw`
     lastSpeedAt: performance.now(),
     writer: null,
     workflowPromise: null,
+  };
+
+  const STORAGE_PREFIX = 'alist-crypt-info::';
+  const STORAGE_VERSION = 1;
+
+  const getCacheKey = () => {
+    if (state.cacheKey) return state.cacheKey;
+    if (!state.infoParams) return '';
+    const pathPart = encodeURIComponent(state.infoParams.path || '');
+    const signPart = encodeURIComponent(state.infoParams.sign || '');
+    const key = STORAGE_PREFIX + pathPart + '::' + signPart;
+    state.cacheKey = key;
+    return key;
+  };
+
+  const loadInfoFromCache = () => {
+    const key = getCacheKey();
+    if (!key) return null;
+    if (typeof window === 'undefined' || !window.sessionStorage) return null;
+    try {
+      const raw = window.sessionStorage.getItem(key);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || parsed.version !== STORAGE_VERSION) return null;
+      if (!parsed.data || !parsed.data.meta || !parsed.data.download) return null;
+      return parsed.data;
+    } catch (error) {
+      console.warn('读取缓存信息失败', error);
+      return null;
+    }
+  };
+
+  const saveInfoToCache = (data) => {
+    const key = getCacheKey();
+    if (!key) return;
+    if (typeof window === 'undefined' || !window.sessionStorage) return;
+    try {
+      const payload = JSON.stringify({ version: STORAGE_VERSION, timestamp: Date.now(), data });
+      window.sessionStorage.setItem(key, payload);
+    } catch (error) {
+      console.warn('缓存下载信息失败', error);
+    }
+  };
+
+  const clearInfoCache = () => {
+    const key = getCacheKey();
+    if (!key) return;
+    if (typeof window === 'undefined' || !window.sessionStorage) return;
+    try {
+      window.sessionStorage.removeItem(key);
+    } catch (error) {
+      console.warn('清理缓存信息失败', error);
+    }
   };
 
   const resetProgressBars = () => {
@@ -251,7 +304,7 @@ const pageScript = String.raw`
     state.paused = value;
     if (value) {
       toggleBtn.textContent = '继续下载';
-      setStatus('已暂停');
+      setStatus('下载已暂停');
       for (const segment of state.segments) {
         if (segment.controller) {
           segment.controller.abort();
@@ -268,7 +321,7 @@ const pageScript = String.raw`
   const prepareSegments = () => {
     const segments = [];
     const pending = [];
-    const segmentSize = state.blockDataSize * 16 || 64 * 1024;
+    const segmentSize = Math.max(state.blockDataSize || 0, SEGMENT_SIZE_BYTES);
     let offset = 0;
     let index = 0;
     let totalEncrypted = 0;
@@ -276,7 +329,7 @@ const pageScript = String.raw`
       const length = Math.min(segmentSize, state.total - offset);
       const mapping = calculateUnderlying(offset, length, state.meta);
       if (!mapping || mapping.underlyingLimit <= 0) {
-        throw new Error('无法计算有效的数据块');
+        throw new Error('无法计算有效的加密数据段');
       }
       segments.push({
         index,
@@ -324,9 +377,52 @@ const pageScript = String.raw`
     return infoUrl;
   };
 
-  const fetchInfo = async ({ initial = false, refresh = false } = {}) => {
-    if (!refresh && !initial && !state.infoParams) {
-      throw new Error('缺少初始信息');
+    const applyInfo = (data, { fromCache = false } = {}) => {
+    if (!data || !data.meta || !data.download) {
+      throw new Error('下载信息不完整');
+    }
+    if (!data.download.url) {
+      throw new Error('缺少远程下载地址');
+    }
+    const meta = data.meta;
+    const download = data.download;
+
+    state.meta = meta;
+    state.remote = {
+      url: download.url,
+      method: download.method || 'GET',
+      headers: Array.isArray(download.headers) ? download.headers : [],
+      rawPath: download.rawPath || '',
+    };
+    state.total = Number(meta.size) || 0;
+    state.blockDataSize = Number(meta.blockDataSize) || 0;
+    state.blockHeaderSize = Number(meta.blockHeaderSize) || 0;
+    state.fileHeaderSize = Number(meta.fileHeaderSize) || 0;
+    state.dataKey = base64ToUint8(meta.dataKey);
+    state.baseNonce = base64ToUint8(meta.nonce);
+    state.started = false;
+    state.paused = false;
+    state.mode = 'idle';
+    state.resumeResolvers = [];
+    state.writer = null;
+    state.workflowPromise = null;
+    state.cacheHit = fromCache;
+
+    prepareSegments();
+    resetProgressBars();
+    updateProgress();
+    fileNameEl.textContent = meta.fileName || state.infoParams.path.split('/').pop() || '未命名文件';
+    state.infoReady = true;
+    toggleBtn.textContent = '开始下载';
+    toggleBtn.disabled = false;
+    retryBtn.disabled = true;
+    logEl.innerHTML = '';
+    setStatus(fromCache ? '已从缓存恢复下载信息，随时可以开始下载。' : '信息获取成功，可以开始下载。');
+  };
+
+  const fetchInfo = async ({ initial = false, forceRefresh = false } = {}) => {
+    if (!initial && !state.infoParams) {
+      throw new Error('缺少初始化信息');
     }
     if (initial) {
       const currentUrl = new URL(window.location.href);
@@ -340,6 +436,17 @@ const pageScript = String.raw`
         path,
         sign,
       };
+      state.cacheKey = '';
+    }
+
+    if (forceRefresh) {
+      clearInfoCache();
+    } else {
+      const cached = loadInfoFromCache();
+      if (cached) {
+        applyInfo(cached, { fromCache: true });
+        return cached;
+      }
     }
 
     const infoUrl = buildInfoUrl();
@@ -347,150 +454,167 @@ const pageScript = String.raw`
       headers: { Accept: 'application/json' },
     });
     if (!response.ok) {
-      throw new Error('获取信息失败：' + response.status);
+      throw new Error('获取信息失败，HTTP ' + response.status);
     }
     const payload = await response.json();
-    if (payload.code !== 200) {
+    if (payload.code !== 200 || !payload.data) {
       throw new Error(payload.message || '接口返回异常');
     }
     const data = payload.data;
-
-    if (refresh) {
-      state.session = data.session;
-      state.downloadUrl = data.downloadUrl;
-      log('已刷新下载会话');
-      return data;
-    }
-
-    state.meta = data.meta;
-    state.session = data.session;
-    state.downloadUrl = data.downloadUrl;
-    state.total = data.meta.size;
-    state.blockDataSize = data.meta.blockDataSize;
-    state.blockHeaderSize = data.meta.blockHeaderSize;
-    state.fileHeaderSize = data.meta.fileHeaderSize;
-    state.dataKey = base64ToUint8(data.meta.dataKey);
-    state.baseNonce = base64ToUint8(data.meta.nonce);
-    state.started = false;
-    state.paused = false;
-    state.mode = 'idle';
-    state.resumeResolvers = [];
-    state.writer = null;
-    prepareSegments();
-    resetProgressBars();
-    updateProgress();
-    fileNameEl.textContent = data.meta.fileName || state.infoParams.path.split('/').pop() || '未命名文件';
-    state.infoReady = true;
-    toggleBtn.textContent = '开始下载';
-    toggleBtn.disabled = false;
-    retryBtn.disabled = true;
-    setStatus('信息获取成功，请点击“开始下载”');
-    logEl.innerHTML = '';
+    applyInfo(data);
+    saveInfoToCache(data);
     return data;
   };
 
-  const refreshSession = async () => {
-    if (state.refreshingSession) {
-      return state.refreshingSession;
+  const buildRemoteHeaders = () => {
+    const headers = new Headers();
+    if (state.remote && Array.isArray(state.remote.headers)) {
+      state.remote.headers.forEach((entry) => {
+        if (!Array.isArray(entry) || entry.length < 2) return;
+        const [key, value] = entry;
+        if (!key) return;
+        if (value === undefined || value === null) return;
+        headers.set(key, String(value));
+      });
     }
-    const promise = (async () => {
-      setStatus('会话已过期，尝试刷新…');
-      const data = await fetchInfo({ refresh: true });
-      if (data.meta) {
-        if (data.meta.size !== state.total || data.meta.blockDataSize !== state.blockDataSize) {
-          throw new Error('刷新后元数据与当前会话不一致');
-        }
-      }
-      setStatus('会话刷新成功，继续下载');
-    })();
-    state.refreshingSession = promise;
-    try {
-      await promise;
-    } finally {
-      state.refreshingSession = null;
-    }
+    headers.delete('Range');
+    headers.set('Accept-Encoding', 'identity');
+    return headers;
   };
 
   const downloadSegment = async (index) => {
     const segment = state.segments[index];
     if (!segment || segment.encrypted) return;
-    const headers = new Headers();
-    const start = segment.mapping.underlyingOffset;
-    const end = start + segment.mapping.underlyingLimit - 1;
-    headers.set('Range', 'bytes=' + start + '-' + end);
+    if (!state.remote || !state.remote.url) {
+      throw new Error('远程下载信息缺失');
+    }
+    const headers = buildRemoteHeaders();
+    const startOffset = segment.mapping.underlyingOffset;
+    const endOffset = startOffset + segment.mapping.underlyingLimit - 1;
+    headers.set('Range', 'bytes=' + startOffset + '-' + endOffset);
+
     const controller = new AbortController();
     segment.controller = controller;
-    const response = await fetch(state.downloadUrl, {
-      method: 'GET',
+    const response = await fetch(state.remote.url, {
+      method: state.remote.method || 'GET',
       headers,
       signal: controller.signal,
     });
     segment.controller = null;
-    if (response.status === 410) {
-      const error = new Error('session expired');
-      error.code = SESSION_EXPIRED_CODE;
-      throw error;
-    }
+
     if (!(response.ok || response.status === 206)) {
-      throw new Error('上游返回状态 ' + response.status);
+      throw new Error('远程响应状态 ' + response.status);
     }
-    const buffer = new Uint8Array(await response.arrayBuffer());
-    if (buffer.length === 0) {
-      throw new Error('上游返回空数据');
+    const chunks = [];
+    let received = 0;
+    const reader = response.body && response.body.getReader ? response.body.getReader() : null;
+    if (reader) {
+      // Stream the response to update progress incrementally.
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (!value || value.length === 0) continue;
+        chunks.push(value);
+        received += value.length;
+        state.downloadedEncrypted += value.length;
+        state.bytesSinceSpeedCheck += value.length;
+        updateProgress();
+      }
+    } else {
+      const arrayBuffer = await response.arrayBuffer();
+      const chunk = new Uint8Array(arrayBuffer);
+      if (chunk.length > 0) {
+        chunks.push(chunk);
+        received += chunk.length;
+        state.downloadedEncrypted += chunk.length;
+        state.bytesSinceSpeedCheck += chunk.length;
+      }
+    }
+
+    if (received === 0) {
+      throw new Error('远程响应为空');
+    }
+    const buffer = new Uint8Array(received);
+    let position = 0;
+    for (const chunk of chunks) {
+      buffer.set(chunk, position);
+      position += chunk.length;
     }
     segment.encrypted = buffer;
-    state.downloadedEncrypted += buffer.length;
-    state.bytesSinceSpeedCheck += buffer.length;
     updateProgress();
   };
 
   const downloadAllSegments = async () => {
-    const worker = async () => {
-      while (true) {
-        if (state.paused) {
-          await waitForResume();
-          continue;
-        }
-        const index = takeSegment();
-        if (index === undefined) {
-          return;
-        }
-        const segment = state.segments[index];
-        if (!segment || segment.encrypted) {
-          continue;
-        }
+    if (state.segments.length === 0) return;
+
+    const inFlight = new Set();
+
+    const launchSegment = (index) => {
+      const segment = state.segments[index];
+      if (!segment || segment.encrypted) {
+        return null;
+      }
+      const task = (async () => {
         try {
           await downloadSegment(index);
           segment.retries = 0;
         } catch (error) {
           if (error && error.name === 'AbortError') {
             enqueueSegment(index, true);
-            continue;
+            return;
           }
-          if (error && error.code === SESSION_EXPIRED_CODE) {
-            await refreshSession();
-            enqueueSegment(index, true);
-            continue;
-          }
+          const message = error instanceof Error && error.message ? error.message : '未知错误';
           segment.retries += 1;
           if (segment.retries <= MAX_RETRY_PER_SEGMENT) {
             const attempt = segment.retries;
-            setStatus('分段 #' + (index + 1) + ' 下载失败（' + error.message + '），' + Math.round(RETRY_DELAY_MS / 1000) + ' 秒后重试（' + attempt + '/' + MAX_RETRY_PER_SEGMENT + '）');
+            setStatus('分段 #' + (index + 1) + ' 下载失败：' + message + '，' + Math.round(RETRY_DELAY_MS / 1000) + ' 秒后重试（' + attempt + '/' + MAX_RETRY_PER_SEGMENT + '）');
             await sleep(RETRY_DELAY_MS);
             enqueueSegment(index, true);
-            continue;
+            return;
           }
           throw error;
         }
-      }
+      })().finally(() => {
+        inFlight.delete(task);
+      });
+      inFlight.add(task);
+      return task;
     };
 
-    const workers = [];
-    const workerCount = Math.min(MAX_CONCURRENCY, state.segments.length);
-    for (let i = 0; i < workerCount; i += 1) {
-      workers.push(worker());
+    let lastDispatchAt = 0;
+    const rateDelay = async () => {
+      const now = performance.now();
+      const elapsed = now - lastDispatchAt;
+      if (elapsed < REQUEST_INTERVAL_MS) {
+        await sleep(REQUEST_INTERVAL_MS - elapsed);
+      }
+      lastDispatchAt = performance.now();
+    };
+
+    while (true) {
+      if (state.paused) {
+        await waitForResume();
+        lastDispatchAt = performance.now();
+        continue;
+      }
+      const index = takeSegment();
+      if (index === undefined) {
+        const pending = Array.from(inFlight);
+        if (pending.length === 0) {
+          break;
+        }
+        try {
+          await Promise.race(pending);
+        } catch (error) {
+          throw error;
+        }
+        continue;
+      }
+      launchSegment(index);
+      await rateDelay();
     }
-    await Promise.all(workers);
+
+    await Promise.all(inFlight);
 
     const unfinished = state.segments.find((segment) => !segment.encrypted);
     if (unfinished) {
@@ -498,7 +622,7 @@ const pageScript = String.raw`
     }
   };
 
-  const decryptSegment = async (segment) => {
+const decryptSegment = async (segment) => {
     if (!segment.encrypted) {
       throw new Error('缺少加密数据');
     }
@@ -570,13 +694,13 @@ const pageScript = String.raw`
     }
   };
 
-  const startWorkflow = async () => {
+    const startWorkflow = async () => {
     if (state.workflowPromise) return;
     state.workflowPromise = (async () => {
       try {
         if (!state.infoReady) return;
         if (!window.nacl || !window.nacl.secretbox || !window.nacl.secretbox.open) {
-          throw new Error('TweetNaCl 加载失败，请刷新页面重试');
+          throw new Error('TweetNaCl 初始化失败，请刷新页面重试');
         }
         await ensureWriter(state.meta.fileName);
         refreshPendingQueue();
@@ -587,7 +711,7 @@ const pageScript = String.raw`
         toggleBtn.textContent = '暂停';
         toggleBtn.disabled = false;
         retryBtn.disabled = true;
-        setStatus('正在下载（' + MAX_CONCURRENCY + ' 线程）');
+        setStatus('开始下载，目标速率 ' + REQUESTS_PER_SECOND + ' 请求/秒');
         if (state.speedTimer) {
           clearInterval(state.speedTimer);
         }
@@ -599,37 +723,30 @@ const pageScript = String.raw`
         }
         updateSpeed();
         state.mode = 'decrypting';
-        toggleBtn.textContent = '解密中';
+        toggleBtn.textContent = '处理中';
         toggleBtn.disabled = true;
-        setStatus('全部分段下载完成，执行解密');
+        setStatus('所有分段下载完成，开始解密');
         await decryptAllSegments();
         state.decrypted = state.total;
         updateProgress();
         await finalizeWriter();
         state.mode = 'finished';
         toggleBtn.textContent = '完成';
-        setStatus('解密完成，文件已保存');
+        setStatus('下载完成，文件已保存');
         retryBtn.disabled = true;
       } catch (error) {
         console.error(error);
         if (error && error.name === 'AbortError' && state.paused) {
-          setStatus('已暂停');
-        } else if (error && error.code === SESSION_EXPIRED_CODE) {
-          setStatus('会话刷新失败：' + error.message);
-          retryBtn.disabled = false;
-          toggleBtn.textContent = '开始下载';
-          toggleBtn.disabled = false;
-          state.started = false;
-          state.mode = 'idle';
+          setStatus('下载已暂停');
         } else if (error instanceof Error) {
-          setStatus('处理失败：' + error.message);
+          setStatus('流程失败：' + error.message);
           retryBtn.disabled = false;
           toggleBtn.textContent = '开始下载';
           toggleBtn.disabled = false;
           state.started = false;
           state.mode = 'idle';
         } else {
-          setStatus('处理失败，已中止');
+          setStatus('流程失败：发生未知错误');
           retryBtn.disabled = false;
           toggleBtn.textContent = '开始下载';
           toggleBtn.disabled = false;
@@ -647,7 +764,7 @@ const pageScript = String.raw`
     await state.workflowPromise;
   };
 
-  toggleBtn.addEventListener('click', () => {
+toggleBtn.addEventListener('click', () => {
     if (!state.infoReady) return;
     if (!state.started) {
       startWorkflow();
@@ -658,12 +775,12 @@ const pageScript = String.raw`
     }
   });
 
-  retryBtn.addEventListener('click', () => {
+    retryBtn.addEventListener('click', () => {
     if (state.workflowPromise) return;
     toggleBtn.disabled = true;
     toggleBtn.textContent = '加载中';
     retryBtn.disabled = true;
-    fetchInfo({ initial: true }).catch((error) => {
+    fetchInfo({ initial: true, forceRefresh: true }).catch((error) => {
       console.error(error);
       setStatus('重新获取信息失败：' + error.message);
       toggleBtn.disabled = false;
@@ -686,6 +803,7 @@ const pageScript = String.raw`
       retryBtn.disabled = false;
     }
   };
+
 
   initialise();
 })();
