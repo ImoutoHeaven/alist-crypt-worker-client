@@ -2363,7 +2363,7 @@ const renderLandingPageHtml = (path) => {
           <input id="parallelLimitInput" class="retry-input" type="number" inputmode="numeric" autocomplete="off" min="1" max="32" value="6">
           <label class="retry-label" for="connectionLimitInput">
             最大打开连接数
-            <span class="retry-hint">范围 1-32，默认 16</span>
+            <span class="retry-hint">范围 1-32，默认 4</span>
           </label>
           <input id="connectionLimitInput" class="retry-input" type="number" inputmode="numeric" autocomplete="off" min="1" max="32" value="16">
         </div>
