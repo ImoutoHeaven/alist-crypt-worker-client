@@ -1473,7 +1473,7 @@ toggleBtn.addEventListener('click', () => {
   clearEnvBtn.addEventListener('click', () => {
     refreshInfoAfterCleanup({ clearSegments: true }).catch((error) => {
       console.error(error);
-      setStatus('清理环境失败：' + (error && error.message ? error.message : '未知错误'));
+      setStatus('清理数据失败：' + (error && error.message ? error.message : '未知错误'));
       clearCacheBtn.disabled = false;
       clearEnvBtn.disabled = false;
       toggleBtn.disabled = false;
@@ -1700,7 +1700,6 @@ const renderLandingPageHtml = (path) => {
         display: flex;
         flex-direction: column;
         gap: 0.75rem;
-        margin-top: auto;
       }
       .advanced-actions button {
         width: 100%;
@@ -1763,15 +1762,15 @@ const renderLandingPageHtml = (path) => {
           <button id="advancedCloseBtn" type="button" class="advanced-close">关闭</button>
         </div>
         <div class="advanced-body">
+          <div class="advanced-actions">
+            <button id="clearCacheBtn" disabled>清理缓存</button>
+            <button id="clearEnvBtn" disabled>清理数据</button>
+          </div>
           <label class="retry-label" for="retryLimitInput">
             分段重试次数
             <span class="retry-hint">支持正整数或 inf（无限重试）</span>
           </label>
           <input id="retryLimitInput" class="retry-input" type="text" inputmode="numeric" autocomplete="off" value="10">
-          <div class="advanced-actions">
-            <button id="clearCacheBtn" disabled>清理缓存</button>
-            <button id="clearEnvBtn" disabled>清理环境</button>
-          </div>
         </div>
       </aside>
       <div id="advancedBackdrop" class="advanced-backdrop" hidden></div>
