@@ -20,6 +20,11 @@ const pageScript = String.raw`
   const MIN_PARALLEL_THREADS = 1;
   const MAX_PARALLEL_THREADS = 32;
   const PARALLEL_STORAGE_KEY = 'alist-crypt-parallelism';
+  const DEFAULT_MAX_CONNECTIONS = 16;
+  const MIN_CONNECTIONS = 1;
+  const MAX_CONNECTIONS = 32;
+  const CONNECTION_STORAGE_KEY = 'alist-crypt-max-connections';
+  const CANCELLATION_ERROR_NAME = 'DownloadCancelled';
   const $ = (id) => document.getElementById(id);
   const statusEl = $('status');
   const fileNameEl = $('fileName');
@@ -36,8 +41,10 @@ const pageScript = String.raw`
   const advancedCloseBtn = $('advancedCloseBtn');
   const retryLimitInput = $('retryLimitInput');
   const parallelLimitInput = $('parallelLimitInput');
+  const connectionLimitInput = $('connectionLimitInput');
   const clearCacheBtn = $('clearCacheBtn');
   const clearEnvBtn = $('clearEnvBtn');
+  const cancelBtn = $('cancelBtn');
   const logEl = $('log');
 
   const log = (message) => {
@@ -151,6 +158,8 @@ const pageScript = String.raw`
     segmentRetryRaw: String(DEFAULT_SEGMENT_RETRY_LIMIT),
     decryptParallelism: DEFAULT_PARALLEL_THREADS,
     decryptParallelRaw: String(DEFAULT_PARALLEL_THREADS),
+    maxOpenConnections: DEFAULT_MAX_CONNECTIONS,
+    maxOpenConnectionsRaw: String(DEFAULT_MAX_CONNECTIONS),
     advancedOpen: false,
     segments: [],
     pendingSegments: [],
@@ -168,6 +177,24 @@ const pageScript = String.raw`
     writerHandle: null,
     writerKey: '',
     workflowPromise: null,
+    cancelled: false,
+  };
+
+  const createCancellationError = () => {
+    const error = new Error('下载已取消');
+    error.name = CANCELLATION_ERROR_NAME;
+    error.retryable = false;
+    return error;
+  };
+
+  const isCancelled = () => state.cancelled === true;
+
+  const requestCancellation = () => {
+    state.cancelled = true;
+  };
+
+  const resetCancellation = () => {
+    state.cancelled = false;
   };
 
   const formatRetryLimit = (value) => (Number.isFinite(value) ? String(value) + ' 次' : '无限重试');
@@ -204,6 +231,12 @@ const pageScript = String.raw`
     }
   };
 
+  const syncConnectionInput = () => {
+    if (connectionLimitInput) {
+      connectionLimitInput.value = state.maxOpenConnectionsRaw;
+    }
+  };
+
   const loadParallelSetting = () => {
     if (typeof window === 'undefined' || !window.localStorage) return null;
     try {
@@ -228,6 +261,30 @@ const pageScript = String.raw`
     }
   };
 
+  const loadConnectionSetting = () => {
+    if (typeof window === 'undefined' || !window.localStorage) return null;
+    try {
+      const stored = window.localStorage.getItem(CONNECTION_STORAGE_KEY);
+      if (!stored) return null;
+      const parsed = Number.parseInt(stored, 10);
+      if (!Number.isFinite(parsed)) return null;
+      if (parsed < MIN_CONNECTIONS || parsed > MAX_CONNECTIONS) return null;
+      return parsed;
+    } catch (error) {
+      console.warn('读取最大连接数设置失败', error);
+      return null;
+    }
+  };
+
+  const persistConnectionSetting = (rawValue) => {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    try {
+      window.localStorage.setItem(CONNECTION_STORAGE_KEY, rawValue);
+    } catch (error) {
+      console.warn('保存最大连接数设置失败', error);
+    }
+  };
+
   const applyParallelValue = (inputValue, { notify = false, persist = true } = {}) => {
     const rawInput = typeof inputValue === 'string' ? inputValue.trim() : '';
     if (!rawInput) {
@@ -247,6 +304,39 @@ const pageScript = String.raw`
       log('并行解密线程数已更新为 ' + parsed + ' 条线程');
     }
     return { ok: true, limit: parsed, raw: state.decryptParallelRaw };
+  };
+
+  const applyConnectionLimitValue = (inputValue, { notify = false, persist = true } = {}) => {
+    const rawInput = typeof inputValue === 'string' ? inputValue.trim() : '';
+    if (!rawInput) {
+      state.maxOpenConnections = DEFAULT_MAX_CONNECTIONS;
+      state.maxOpenConnectionsRaw = String(DEFAULT_MAX_CONNECTIONS);
+      syncConnectionInput();
+      if (persist) {
+        persistConnectionSetting(state.maxOpenConnectionsRaw);
+      }
+      return { ok: false, reason: 'empty' };
+    }
+    const parsed = Number.parseInt(rawInput, 10);
+    if (!Number.isFinite(parsed) || parsed < MIN_CONNECTIONS || parsed > MAX_CONNECTIONS) {
+      state.maxOpenConnections = DEFAULT_MAX_CONNECTIONS;
+      state.maxOpenConnectionsRaw = String(DEFAULT_MAX_CONNECTIONS);
+      syncConnectionInput();
+      if (persist) {
+        persistConnectionSetting(state.maxOpenConnectionsRaw);
+      }
+      return { ok: false, reason: 'invalid' };
+    }
+    state.maxOpenConnections = parsed;
+    state.maxOpenConnectionsRaw = String(parsed);
+    syncConnectionInput();
+    if (persist) {
+      persistConnectionSetting(state.maxOpenConnectionsRaw);
+    }
+    if (notify) {
+      log('最大打开连接数已更新为 ' + parsed + ' 条连接');
+    }
+    return { ok: true, limit: parsed, raw: state.maxOpenConnectionsRaw };
   };
 
   const syncAdvancedPanel = () => {
@@ -316,6 +406,15 @@ const pageScript = String.raw`
     state.decryptParallelRaw = String(storedParallel);
   }
 
+  const storedConnections = loadConnectionSetting();
+  if (Number.isFinite(storedConnections)) {
+    state.maxOpenConnections = storedConnections;
+    state.maxOpenConnectionsRaw = String(storedConnections);
+  } else {
+    state.maxOpenConnections = DEFAULT_MAX_CONNECTIONS;
+    state.maxOpenConnectionsRaw = String(DEFAULT_MAX_CONNECTIONS);
+  }
+
   if (advancedToggleBtn) {
     advancedToggleBtn.setAttribute('aria-controls', 'advancedPanel');
     advancedToggleBtn.setAttribute('aria-expanded', 'false');
@@ -323,6 +422,7 @@ const pageScript = String.raw`
   syncAdvancedPanel();
   syncRetryInput();
   syncParallelInput();
+  syncConnectionInput();
 
   const STORAGE_PREFIX = 'alist-crypt-info::';
   const STORAGE_VERSION = 1;
@@ -400,6 +500,15 @@ const pageScript = String.raw`
     await runWriterStore('readwrite', (store) => store.delete(key));
   };
 
+  const removePersistedWriterHandle = async (key) => {
+    if (!key) return;
+    await deleteWriterHandle(key);
+    if (state.writerKey === key) {
+      state.writerKey = '';
+      state.writerHandle = null;
+    }
+  };
+
   const ensureHandlePermission = async (handle) => {
     if (!handle) return false;
     const ensure = async (mode) => {
@@ -459,6 +568,19 @@ const pageScript = String.raw`
     return key;
   };
 
+  const removeInfoCacheByKey = (key) => {
+    if (!key) return;
+    if (typeof window === 'undefined' || !window.sessionStorage) return;
+    try {
+      window.sessionStorage.removeItem(key);
+    } catch (error) {
+      console.warn('清理缓存信息失败', error);
+    }
+    if (state.cacheKey === key) {
+      state.cacheKey = '';
+    }
+  };
+
   const loadInfoFromCache = () => {
     const key = getCacheKey();
     if (!key) return null;
@@ -490,13 +612,7 @@ const pageScript = String.raw`
 
   const clearInfoCache = () => {
     const key = getCacheKey();
-    if (!key) return;
-    if (typeof window === 'undefined' || !window.sessionStorage) return;
-    try {
-      window.sessionStorage.removeItem(key);
-    } catch (error) {
-      console.warn('清理缓存信息失败', error);
-    }
+    removeInfoCacheByKey(key);
   };
 
   const resetProgressBars = () => {
@@ -542,7 +658,14 @@ const pageScript = String.raw`
     toggleBtn.textContent = '处理中';
   };
 
-  const clearDownloadEnvironment = async () => {
+  const clearDownloadEnvironment = async ({
+    preserveMetadata = false,
+    clearCache = false,
+    dropHandles = false,
+    resetProgress = true,
+  } = {}) => {
+    const cacheKey = state.cacheKey || getCacheKey();
+    const writerKey = state.writerKey;
     if (state.speedTimer) {
       clearInterval(state.speedTimer);
       state.speedTimer = null;
@@ -559,24 +682,75 @@ const pageScript = String.raw`
     });
     state.segments = [];
     state.pendingSegments = [];
-    state.total = 0;
-    state.totalEncrypted = 0;
-    state.downloadedEncrypted = 0;
-    state.decrypted = 0;
     state.resumeResolvers.splice(0, state.resumeResolvers.length).forEach((resolve) => resolve());
     state.workflowPromise = null;
     state.started = false;
     state.paused = false;
     state.mode = 'idle';
-    state.infoReady = false;
     state.cacheHit = false;
-    state.meta = null;
-    state.remote = null;
-    state.dataKey = null;
-    state.baseNonce = null;
+    if (!preserveMetadata) {
+      state.total = 0;
+      state.totalEncrypted = 0;
+      state.downloadedEncrypted = 0;
+      state.decrypted = 0;
+      state.infoReady = false;
+      state.meta = null;
+      state.remote = null;
+      state.dataKey = null;
+      state.baseNonce = null;
+    }
     await releaseCurrentWriter();
-    resetProgressBars();
+    state.writerHandle = null;
+    state.writer = null;
+    if (dropHandles && writerKey) {
+      await removePersistedWriterHandle(writerKey);
+    }
+    if (clearCache && cacheKey) {
+      removeInfoCacheByKey(cacheKey);
+    }
+    if (resetProgress) {
+      resetProgressBars();
+    }
+    if (cancelBtn) {
+      cancelBtn.disabled = true;
+    }
+    resetCancellation();
     updateToggleLabel();
+  };
+
+  const purgeSegmentBuffers = () => {
+    state.segments.forEach((segment) => {
+      segment.encrypted = null;
+      segment.controller = null;
+    });
+    state.segments = [];
+    state.pendingSegments = [];
+  };
+
+  const cleanupAfterSuccessfulDownload = async () => {
+    const cacheKey = state.cacheKey || getCacheKey();
+    const writerKey = state.writerKey;
+    purgeSegmentBuffers();
+    if (cacheKey) {
+      removeInfoCacheByKey(cacheKey);
+    }
+    if (writerKey) {
+      await removePersistedWriterHandle(writerKey);
+    }
+    state.infoReady = false;
+    resetCancellation();
+    if (cancelBtn) {
+      cancelBtn.disabled = true;
+    }
+    if (clearCacheBtn) {
+      clearCacheBtn.disabled = true;
+    }
+    if (clearEnvBtn) {
+      clearEnvBtn.disabled = true;
+    }
+    if (toggleBtn) {
+      toggleBtn.disabled = true;
+    }
   };
 
   const waitWhilePaused = async () => {
@@ -702,6 +876,9 @@ const pageScript = String.raw`
     anchor.click();
     document.body.removeChild(anchor);
     setTimeout(() => URL.revokeObjectURL(url), 1000);
+    if (Array.isArray(state.writer.chunks)) {
+      state.writer.chunks.length = 0;
+    }
     state.writer = null;
     log('已触发浏览器下载');
   };
@@ -886,6 +1063,16 @@ const pageScript = String.raw`
         }
       }
     }
+    if (data.settings && data.settings.maxConnections !== undefined) {
+      const workerConnections = String(data.settings.maxConnections).trim();
+      if (workerConnections) {
+        const appliedConnections = applyConnectionLimitValue(workerConnections, { notify: false, persist: true });
+        if (!appliedConnections.ok) {
+          log('来自 worker 的最大连接数设置无效：' + workerConnections);
+          syncConnectionInput();
+        }
+      }
+    }
     const previousMeta = state.meta;
     const previousSegments = state.segments;
 
@@ -926,6 +1113,9 @@ const pageScript = String.raw`
     retryBtn.disabled = true;
     clearCacheBtn.disabled = false;
     clearEnvBtn.disabled = false;
+    if (cancelBtn) {
+      cancelBtn.disabled = true;
+    }
     logEl.innerHTML = '';
     const statusMessage = fromCache
       ? '已从缓存恢复下载信息，随时可以开始下载。'
@@ -1061,6 +1251,9 @@ const pageScript = String.raw`
     retryBtn.disabled = true;
     clearCacheBtn.disabled = true;
     clearEnvBtn.disabled = true;
+    if (cancelBtn) {
+      cancelBtn.disabled = true;
+    }
     state.infoReady = false;
     setStatus(actionLabel + '中，请稍候...');
     log(actionLabel + '操作开始');
@@ -1080,6 +1273,9 @@ const pageScript = String.raw`
       toggleBtn.disabled = false;
       clearCacheBtn.disabled = false;
       clearEnvBtn.disabled = false;
+      if (cancelBtn) {
+        cancelBtn.disabled = true;
+      }
     } catch (error) {
       console.error(error);
       setStatus(actionLabel + '后重新获取信息失败：' + error.message);
@@ -1088,6 +1284,9 @@ const pageScript = String.raw`
       retryBtn.disabled = false;
       clearCacheBtn.disabled = false;
       clearEnvBtn.disabled = false;
+      if (cancelBtn) {
+        cancelBtn.disabled = true;
+      }
       return;
     }
   };
@@ -1111,6 +1310,9 @@ const pageScript = String.raw`
   const downloadSegment = async (index) => {
     const segment = state.segments[index];
     if (!segment || segment.encrypted) return;
+    if (isCancelled()) {
+      throw createCancellationError();
+    }
     if (!state.remote || !state.remote.url) {
       throw new Error('远程下载信息缺失');
     }
@@ -1142,6 +1344,13 @@ const pageScript = String.raw`
       if (reader) {
         // Stream the response to update progress incrementally.
         while (true) {
+          if (isCancelled()) {
+            controller.abort();
+            throw createCancellationError();
+          }
+          if (state.paused) {
+            await waitWhilePaused();
+          }
           const { value, done } = await reader.read();
           if (done) break;
           if (!value || value.length === 0) continue;
@@ -1152,6 +1361,10 @@ const pageScript = String.raw`
           updateProgress();
         }
       } else {
+        if (isCancelled()) {
+          controller.abort();
+          throw createCancellationError();
+        }
         const arrayBuffer = await response.arrayBuffer();
         const chunk = new Uint8Array(arrayBuffer);
         if (chunk.length > 0) {
@@ -1180,6 +1393,9 @@ const pageScript = String.raw`
         state.bytesSinceSpeedCheck = Math.max(0, state.bytesSinceSpeedCheck - received);
         updateProgress();
       }
+      if (isCancelled() || (error && error.name === 'AbortError' && state.cancelled)) {
+        throw createCancellationError();
+      }
       throw error;
     } finally {
       segment.controller = null;
@@ -1190,10 +1406,14 @@ const pageScript = String.raw`
     if (state.segments.length === 0) return;
 
     const inFlight = new Set();
+    const maxConnections = resolveConnectionLimit();
 
     const launchSegment = (index) => {
       const segment = state.segments[index];
       if (!segment || segment.encrypted) {
+        return null;
+      }
+      if (isCancelled()) {
         return null;
       }
       const task = (async () => {
@@ -1201,6 +1421,12 @@ const pageScript = String.raw`
           await downloadSegment(index);
           segment.retries = 0;
         } catch (error) {
+          if (error && error.name === CANCELLATION_ERROR_NAME) {
+            throw error;
+          }
+          if (isCancelled()) {
+            throw createCancellationError();
+          }
           if (error && error.name === 'AbortError') {
             enqueueSegment(index, true);
             return;
@@ -1243,20 +1469,33 @@ const pageScript = String.raw`
     };
 
     while (true) {
+      if (isCancelled()) {
+        throw createCancellationError();
+      }
       if (state.paused) {
         await waitForResume();
         lastDispatchAt = performance.now();
         continue;
       }
+      if (inFlight.size >= maxConnections && inFlight.size > 0) {
+        try {
+          await Promise.race(inFlight);
+        } catch (error) {
+          throw error;
+        }
+        continue;
+      }
       const index = takeSegment();
       if (index === undefined) {
-        const pending = Array.from(inFlight);
-        if (pending.length === 0) {
+        if (inFlight.size === 0) {
           break;
         }
         try {
-          await Promise.race(pending);
+          await Promise.race(inFlight);
         } catch (error) {
+          if (error && error.name === CANCELLATION_ERROR_NAME) {
+            throw error;
+          }
           throw error;
         }
         continue;
@@ -1283,6 +1522,9 @@ const pageScript = String.raw`
     if (!segment || !segment.encrypted) {
       throw new Error('缺少加密数据');
     }
+    if (isCancelled()) {
+      throw createCancellationError();
+    }
     const buffer = segment.encrypted;
     const totalNeeded = segment.length;
     const dataKey = state.dataKey;
@@ -1294,6 +1536,9 @@ const pageScript = String.raw`
     const output = new Uint8Array(totalNeeded);
 
     while (offset < buffer.length && produced < totalNeeded) {
+      if (isCancelled()) {
+        throw createCancellationError();
+      }
       if (state.paused) {
         await waitWhilePaused();
       }
@@ -1356,6 +1601,22 @@ const pageScript = String.raw`
     return Math.min(MAX_PARALLEL_THREADS, rounded);
   };
 
+  const clampConnectionLimit = (value) => {
+    if (!Number.isFinite(value)) {
+      return DEFAULT_MAX_CONNECTIONS;
+    }
+    const rounded = Math.floor(value);
+    if (rounded < MIN_CONNECTIONS || rounded > MAX_CONNECTIONS) {
+      return DEFAULT_MAX_CONNECTIONS;
+    }
+    return rounded;
+  };
+
+  const resolveConnectionLimit = () =>
+    clampConnectionLimit(
+      Number.isFinite(state.maxOpenConnections) ? state.maxOpenConnections : DEFAULT_MAX_CONNECTIONS,
+    );
+
   const resolveParallelism = () => {
     const configured = clampParallelThreads(
       Number.isFinite(state.decryptParallelism) ? state.decryptParallelism : DEFAULT_PARALLEL_THREADS,
@@ -1368,6 +1629,9 @@ const pageScript = String.raw`
   };
 
   const decryptAllSegments = async (requestedThreads) => {
+    if (isCancelled()) {
+      throw createCancellationError();
+    }
     setStatus('下载完成，准备解密');
     const requested = Number.isFinite(requestedThreads) ? requestedThreads : resolveParallelism();
     const parallelism = clampParallelThreads(requested);
@@ -1387,6 +1651,9 @@ const pageScript = String.raw`
           while (pendingResults.has(nextToWrite)) {
             const data = pendingResults.get(nextToWrite);
             pendingResults.delete(nextToWrite);
+            if (isCancelled()) {
+              throw createCancellationError();
+            }
             await writeChunk(data);
             state.decrypted = Math.min(state.total, state.decrypted + data.length);
             nextToWrite += 1;
@@ -1406,6 +1673,9 @@ const pageScript = String.raw`
       while (true) {
         if (flushError) {
           throw flushError;
+        }
+        if (isCancelled()) {
+          throw createCancellationError();
         }
         if (state.paused) {
           await waitWhilePaused();
@@ -1431,7 +1701,13 @@ const pageScript = String.raw`
       workers.push(worker());
     }
     await Promise.all(workers);
+    if (isCancelled()) {
+      throw createCancellationError();
+    }
     await flushChain;
+    if (isCancelled()) {
+      throw createCancellationError();
+    }
     if (nextToWrite !== totalSegments) {
       throw new Error('仍有分段未完成解密');
     }
@@ -1445,6 +1721,7 @@ const pageScript = String.raw`
         if (!window.nacl || !window.nacl.secretbox || !window.nacl.secretbox.open) {
           throw new Error('TweetNaCl 初始化失败，请刷新页面重试');
         }
+        resetCancellation();
         await ensureWriter(state.meta.fileName);
         refreshPendingQueue();
         updateProgress();
@@ -1456,6 +1733,9 @@ const pageScript = String.raw`
         retryBtn.disabled = true;
         clearCacheBtn.disabled = true;
         clearEnvBtn.disabled = true;
+        if (cancelBtn) {
+          cancelBtn.disabled = false;
+        }
         setStatus('开始下载，目标速率 ' + REQUESTS_PER_SECOND + ' 请求/秒');
         if (state.speedTimer) {
           clearInterval(state.speedTimer);
@@ -1493,7 +1773,16 @@ const pageScript = String.raw`
         updateToggleLabel();
         setStatus('下载完成，文件已保存');
         retryBtn.disabled = true;
+        await cleanupAfterSuccessfulDownload();
+        state.started = false;
+        state.paused = false;
+        log('已在完成后清理本地缓存与连接信息');
       } catch (error) {
+        if (error && error.name === CANCELLATION_ERROR_NAME) {
+          setStatus('下载已取消');
+          await clearDownloadEnvironment({ clearCache: true, dropHandles: true });
+          return;
+        }
         console.error(error);
         if (error && error.name === 'AbortError' && state.paused) {
           setStatus('下载已暂停');
@@ -1517,6 +1806,9 @@ const pageScript = String.raw`
           updateToggleLabel();
           clearCacheBtn.disabled = false;
           clearEnvBtn.disabled = false;
+        }
+        if (cancelBtn) {
+          cancelBtn.disabled = true;
         }
       } finally {
         if (state.speedTimer) {
@@ -1618,6 +1910,97 @@ const pageScript = String.raw`
     });
   }
 
+  const handleCancelDownload = async () => {
+    if (!state.infoParams && !state.infoReady) {
+      setStatus('尚未初始化下载，无需取消。');
+      return;
+    }
+    if (cancelBtn) {
+      cancelBtn.disabled = true;
+    }
+    toggleBtn.disabled = true;
+    retryBtn.disabled = true;
+    clearCacheBtn.disabled = true;
+    clearEnvBtn.disabled = true;
+    if (state.workflowPromise) {
+      setStatus('正在取消下载，请稍候...');
+      requestCancellation();
+      state.paused = false;
+      state.segments.forEach((segment) => {
+        if (segment && segment.controller) {
+          try {
+            segment.controller.abort();
+          } catch (error) {
+            console.warn('取消时终止分段请求失败', error);
+          }
+        }
+      });
+      state.resumeResolvers.splice(0, state.resumeResolvers.length).forEach((resolve) => resolve());
+      try {
+        await state.workflowPromise;
+      } catch (error) {
+        if (!error || error.name !== CANCELLATION_ERROR_NAME) {
+          console.error(error);
+          await clearDownloadEnvironment({ clearCache: true, dropHandles: true });
+          setStatus('取消下载时发生错误：' + (error && error.message ? error.message : '未知错误'));
+          return;
+        }
+      }
+      try {
+        await fetchInfo({ initial: true, forceRefresh: true });
+        setStatus('下载已取消，信息已刷新，可重新开始。');
+      } catch (error) {
+        console.error(error);
+        setStatus('下载已取消，但重新获取信息失败：' + (error && error.message ? error.message : '未知错误'));
+        toggleBtn.disabled = false;
+        retryBtn.disabled = false;
+        clearCacheBtn.disabled = false;
+        clearEnvBtn.disabled = false;
+      }
+      return;
+    }
+    await clearDownloadEnvironment({ clearCache: true, dropHandles: true });
+    try {
+      await fetchInfo({ initial: true, forceRefresh: true });
+      setStatus('下载已取消，信息已刷新，可重新开始。');
+    } catch (error) {
+      console.error(error);
+      setStatus('下载已取消，但重新获取信息失败：' + (error && error.message ? error.message : '未知错误'));
+      toggleBtn.disabled = false;
+      retryBtn.disabled = false;
+      clearCacheBtn.disabled = false;
+      clearEnvBtn.disabled = false;
+    }
+  };
+
+  const handleConnectionInputCommit = () => {
+    if (!connectionLimitInput) return;
+    const rawInput = connectionLimitInput.value || '';
+    const trimmed = rawInput.trim();
+    if (trimmed === state.maxOpenConnectionsRaw) {
+      syncConnectionInput();
+      return;
+    }
+    const result = applyConnectionLimitValue(trimmed, { notify: true });
+    if (!result.ok) {
+      setStatus('最大打开连接数无效，已恢复为默认值 16。请输入 1-32 之间的整数。');
+      syncConnectionInput();
+      connectionLimitInput.focus({ preventScroll: true });
+    }
+  };
+
+  if (connectionLimitInput) {
+    connectionLimitInput.addEventListener('change', handleConnectionInputCommit);
+    connectionLimitInput.addEventListener('blur', handleConnectionInputCommit);
+    connectionLimitInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        handleConnectionInputCommit();
+        connectionLimitInput.blur();
+      }
+    });
+  }
+
   toggleBtn.addEventListener('click', () => {
     if (!state.infoReady) return;
     if (!state.started) {
@@ -1628,6 +2011,15 @@ const pageScript = String.raw`
       setPaused(!state.paused);
     }
   });
+
+  if (cancelBtn) {
+    cancelBtn.addEventListener('click', () => {
+      handleCancelDownload().catch((error) => {
+        console.error('取消下载时发生未捕获的异常', error);
+        setStatus('取消下载时发生异常：' + (error && error.message ? error.message : '未知错误'));
+      });
+    });
+  }
 
   retryBtn.addEventListener('click', async () => {
     if (state.workflowPromise) return;
@@ -1945,6 +2337,7 @@ const renderLandingPageHtml = (path) => {
       <div class="status">当前速度：<span id="speedText">--</span></div>
       <div class="controls">
         <button id="toggleBtn" disabled>加载中</button>
+        <button id="cancelBtn" disabled>取消下载</button>
         <button id="retryBtn" disabled>重试</button>
         <button id="advancedToggle" class="secondary" type="button">高级选项</button>
       </div>
@@ -1968,6 +2361,11 @@ const renderLandingPageHtml = (path) => {
             <span class="retry-hint">范围 1-32，默认 6</span>
           </label>
           <input id="parallelLimitInput" class="retry-input" type="number" inputmode="numeric" autocomplete="off" min="1" max="32" value="6">
+          <label class="retry-label" for="connectionLimitInput">
+            最大打开连接数
+            <span class="retry-hint">范围 1-32，默认 16</span>
+          </label>
+          <input id="connectionLimitInput" class="retry-input" type="number" inputmode="numeric" autocomplete="off" min="1" max="32" value="16">
         </div>
       </aside>
       <div id="advancedBackdrop" class="advanced-backdrop" hidden></div>
