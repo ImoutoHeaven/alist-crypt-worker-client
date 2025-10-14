@@ -930,6 +930,23 @@ const pageScript = String.raw`
     state.writer = null;
   };
 
+  const isUserCancelledSavePicker = (error) => {
+    if (!error) return false;
+    if (error && typeof error === 'object') {
+      const { name, message } = error;
+      if (typeof name === 'string' && name.toLowerCase() === 'aborterror') {
+        return true;
+      }
+      if (typeof message === 'string') {
+        const lowerMessage = message.toLowerCase();
+        if (lowerMessage.includes('abort') || lowerMessage.includes('cancel')) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
   const formatFsFallbackMessage = (error, fallbackReason) => {
     const reason = fallbackReason ? String(fallbackReason) : '未知原因';
     if (!error) {
@@ -990,7 +1007,9 @@ const pageScript = String.raw`
             types: [{ description: 'Binary file', accept: { 'application/octet-stream': ['.bin'] } }],
           });
         } catch (error) {
-          throw new Error('已取消选择保存位置');
+          const reason = isUserCancelledSavePicker(error) ? '已取消选择保存位置' : '无法选择保存位置';
+          await fallbackToBlobWriter({ error, reason });
+          return;
         }
       }
       const granted = await ensureHandlePermission(handle);
