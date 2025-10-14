@@ -237,53 +237,121 @@ const pageScript = String.raw`
     }
   };
 
-  const loadParallelSetting = () => {
-    if (typeof window === 'undefined' || !window.localStorage) return null;
+  const STORAGE_DB_NAME = 'alist-crypt-storage';
+  const STORAGE_DB_VERSION = 1;
+  const STORAGE_TABLE_SETTINGS = 'settings';
+  const STORAGE_TABLE_INFO = 'infoCache';
+  const STORAGE_TABLE_HANDLES = 'writerHandles';
+
+  const openStorageDatabase = (() => {
+    let promise = null;
+    return () => {
+      if (promise) return promise;
+      promise = (async () => {
+        if (typeof window === 'undefined' || !window.indexedDB || !window.Dexie) {
+          console.warn('Dexie 或 IndexedDB 不可用，本地设置将无法保存');
+          return null;
+        }
+        const DexieClass = window.Dexie;
+        const db = new DexieClass(STORAGE_DB_NAME);
+        db.version(STORAGE_DB_VERSION).stores({
+          [STORAGE_TABLE_SETTINGS]: '&key',
+          [STORAGE_TABLE_INFO]: '&key,timestamp',
+          [STORAGE_TABLE_HANDLES]: '&key',
+        });
+        return db;
+      })().catch((error) => {
+        console.warn('初始化 Dexie 存储失败', error);
+        return null;
+      });
+      return promise;
+    };
+  })();
+
+  const useStorageTable = async (tableName, executor, { defaultValue = null } = {}) => {
+    const db = await openStorageDatabase();
+    if (!db) return defaultValue;
     try {
-      const stored = window.localStorage.getItem(PARALLEL_STORAGE_KEY);
-      if (!stored) return null;
-      const parsed = Number.parseInt(stored, 10);
-      if (!Number.isFinite(parsed)) return null;
-      if (parsed < MIN_PARALLEL_THREADS || parsed > MAX_PARALLEL_THREADS) return null;
-      return parsed;
+      return await executor(db.table(tableName));
     } catch (error) {
-      console.warn('读取并行解密设置失败', error);
-      return null;
+      console.warn('访问 Dexie 表 ' + tableName + ' 时出错', error);
+      return defaultValue;
     }
+  };
+
+  const loadParallelSetting = async () => {
+    const stored = await useStorageTable(STORAGE_TABLE_SETTINGS, (table) =>
+      table.get(PARALLEL_STORAGE_KEY),
+    );
+    if (!stored) return null;
+    const raw =
+      typeof stored === 'string'
+        ? stored
+        : typeof stored.value === 'string'
+          ? stored.value
+          : '';
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isFinite(parsed)) return null;
+    if (parsed < MIN_PARALLEL_THREADS || parsed > MAX_PARALLEL_THREADS) return null;
+    return parsed;
   };
 
   const persistParallelSetting = (rawValue) => {
-    if (typeof window === 'undefined' || !window.localStorage) return;
-    try {
-      window.localStorage.setItem(PARALLEL_STORAGE_KEY, rawValue);
-    } catch (error) {
-      console.warn('保存并行解密设置失败', error);
-    }
+    const payload = String(rawValue || '');
+    useStorageTable(
+      STORAGE_TABLE_SETTINGS,
+      (table) => table.put({ key: PARALLEL_STORAGE_KEY, value: payload }),
+      { defaultValue: undefined },
+    );
   };
 
-  const loadConnectionSetting = () => {
-    if (typeof window === 'undefined' || !window.localStorage) return null;
-    try {
-      const stored = window.localStorage.getItem(CONNECTION_STORAGE_KEY);
-      if (!stored) return null;
-      const parsed = Number.parseInt(stored, 10);
-      if (!Number.isFinite(parsed)) return null;
-      if (parsed < MIN_CONNECTIONS || parsed > MAX_CONNECTIONS) return null;
-      return parsed;
-    } catch (error) {
-      console.warn('读取最大连接数设置失败', error);
-      return null;
-    }
+  const loadConnectionSetting = async () => {
+    const stored = await useStorageTable(STORAGE_TABLE_SETTINGS, (table) =>
+      table.get(CONNECTION_STORAGE_KEY),
+    );
+    if (!stored) return null;
+    const raw =
+      typeof stored === 'string'
+        ? stored
+        : typeof stored.value === 'string'
+          ? stored.value
+          : '';
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isFinite(parsed)) return null;
+    if (parsed < MIN_CONNECTIONS || parsed > MAX_CONNECTIONS) return null;
+    return parsed;
   };
 
   const persistConnectionSetting = (rawValue) => {
-    if (typeof window === 'undefined' || !window.localStorage) return;
-    try {
-      window.localStorage.setItem(CONNECTION_STORAGE_KEY, rawValue);
-    } catch (error) {
-      console.warn('保存最大连接数设置失败', error);
-    }
+    const payload = String(rawValue || '');
+    useStorageTable(
+      STORAGE_TABLE_SETTINGS,
+      (table) => table.put({ key: CONNECTION_STORAGE_KEY, value: payload }),
+      { defaultValue: undefined },
+    );
   };
+
+  const hydrateStoredSettings = async () => {
+    const [storedParallel, storedConnections] = await Promise.all([
+      loadParallelSetting(),
+      loadConnectionSetting(),
+    ]);
+    if (Number.isFinite(storedParallel)) {
+      state.decryptParallelism = storedParallel;
+      state.decryptParallelRaw = String(storedParallel);
+    }
+    if (Number.isFinite(storedConnections)) {
+      state.maxOpenConnections = storedConnections;
+      state.maxOpenConnectionsRaw = String(storedConnections);
+    } else {
+      state.maxOpenConnections = DEFAULT_MAX_CONNECTIONS;
+      state.maxOpenConnectionsRaw = String(DEFAULT_MAX_CONNECTIONS);
+    }
+    syncParallelInput();
+    syncConnectionInput();
+  };
+
+  hydrateStoredSettings();
 
   const applyParallelValue = (inputValue, { notify = false, persist = true } = {}) => {
     const rawInput = typeof inputValue === 'string' ? inputValue.trim() : '';
@@ -400,21 +468,6 @@ const pageScript = String.raw`
     return { ok: true, limit, raw };
   };
 
-  const storedParallel = loadParallelSetting();
-  if (Number.isFinite(storedParallel)) {
-    state.decryptParallelism = storedParallel;
-    state.decryptParallelRaw = String(storedParallel);
-  }
-
-  const storedConnections = loadConnectionSetting();
-  if (Number.isFinite(storedConnections)) {
-    state.maxOpenConnections = storedConnections;
-    state.maxOpenConnectionsRaw = String(storedConnections);
-  } else {
-    state.maxOpenConnections = DEFAULT_MAX_CONNECTIONS;
-    state.maxOpenConnectionsRaw = String(DEFAULT_MAX_CONNECTIONS);
-  }
-
   if (advancedToggleBtn) {
     advancedToggleBtn.setAttribute('aria-controls', 'advancedPanel');
     advancedToggleBtn.setAttribute('aria-expanded', 'false');
@@ -426,78 +479,33 @@ const pageScript = String.raw`
 
   const STORAGE_PREFIX = 'alist-crypt-info::';
   const STORAGE_VERSION = 1;
-  const WRITER_DB_NAME = 'alist-crypt-writer';
-  const WRITER_DB_VERSION = 1;
-  const WRITER_STORE_NAME = 'handles';
-
-  const openWriterDatabase = () =>
-    new Promise((resolve, reject) => {
-      if (typeof window === 'undefined' || !window.indexedDB) {
-        reject(new Error('当前环境不支持 IndexedDB'));
-        return;
-      }
-      const request = window.indexedDB.open(WRITER_DB_NAME, WRITER_DB_VERSION);
-      request.onerror = () => reject(request.error || new Error('打开文件句柄数据库失败'));
-      request.onupgradeneeded = () => {
-        const db = request.result;
-        if (!db.objectStoreNames.contains(WRITER_STORE_NAME)) {
-          db.createObjectStore(WRITER_STORE_NAME);
-        }
-      };
-      request.onsuccess = () => resolve(request.result);
-    });
-
-  const runWriterStore = async (mode, executor) => {
-    try {
-      const db = await openWriterDatabase();
-      return await new Promise((resolve, reject) => {
-        let settled = false;
-        const tx = db.transaction(WRITER_STORE_NAME, mode);
-        const store = tx.objectStore(WRITER_STORE_NAME);
-        const request = executor(store);
-        request.onsuccess = () => {
-          settled = true;
-          resolve(request.result);
-        };
-        request.onerror = () => {
-          settled = true;
-          reject(request.error || new Error('访问文件句柄存储失败'));
-        };
-        tx.oncomplete = () => {
-          if (!settled) resolve(undefined);
-          db.close();
-        };
-        tx.onabort = () => {
-          const reason = tx.error || new Error('文件句柄事务被中止');
-          if (!settled) reject(reason);
-          db.close();
-        };
-        tx.onerror = () => {
-          const reason = tx.error || new Error('文件句柄事务失败');
-          if (!settled) reject(reason);
-          db.close();
-        };
-      });
-    } catch (error) {
-      console.warn('访问文件句柄存储时发生异常', error);
-      return undefined;
-    }
-  };
 
   const saveWriterHandle = async (key, handle) => {
-    if (!key || !handle || typeof window === 'undefined' || !window.indexedDB) return;
-    await runWriterStore('readwrite', (store) => store.put(handle, key));
+    if (!key || !handle) return;
+    await useStorageTable(
+      STORAGE_TABLE_HANDLES,
+      (table) => table.put({ key, handle }),
+      { defaultValue: undefined },
+    );
   };
 
   const loadWriterHandle = async (key) => {
-    if (!key || typeof window === 'undefined' || !window.indexedDB) return null;
-    const handle = await runWriterStore('readonly', (store) => store.get(key));
-    return handle || null;
+    if (!key) return null;
+    const record = await useStorageTable(STORAGE_TABLE_HANDLES, (table) => table.get(key));
+    if (!record) return null;
+    if (record && typeof record === 'object' && 'handle' in record) {
+      return record.handle;
+    }
+    return record;
   };
 
   const deleteWriterHandle = async (key) => {
-    if (!key || typeof window === 'undefined' || !window.indexedDB) return;
-    await runWriterStore('readwrite', (store) => store.delete(key));
+    if (!key) return;
+    await useStorageTable(
+      STORAGE_TABLE_HANDLES,
+      (table) => table.delete(key),
+      { defaultValue: undefined },
+    );
   };
 
   const removePersistedWriterHandle = async (key) => {
@@ -568,51 +576,47 @@ const pageScript = String.raw`
     return key;
   };
 
-  const removeInfoCacheByKey = (key) => {
+  const removeInfoCacheByKey = async (key) => {
     if (!key) return;
-    if (typeof window === 'undefined' || !window.sessionStorage) return;
-    try {
-      window.sessionStorage.removeItem(key);
-    } catch (error) {
-      console.warn('清理缓存信息失败', error);
-    }
+    await useStorageTable(
+      STORAGE_TABLE_INFO,
+      (table) => table.delete(key),
+      { defaultValue: undefined },
+    );
     if (state.cacheKey === key) {
       state.cacheKey = '';
     }
   };
 
-  const loadInfoFromCache = () => {
+  const loadInfoFromCache = async () => {
     const key = getCacheKey();
     if (!key) return null;
-    if (typeof window === 'undefined' || !window.sessionStorage) return null;
-    try {
-      const raw = window.sessionStorage.getItem(key);
-      if (!raw) return null;
-      const parsed = JSON.parse(raw);
-      if (!parsed || parsed.version !== STORAGE_VERSION) return null;
-      if (!parsed.data || !parsed.data.meta || !parsed.data.download) return null;
-      return parsed.data;
-    } catch (error) {
-      console.warn('读取缓存信息失败', error);
-      return null;
-    }
+    const record = await useStorageTable(STORAGE_TABLE_INFO, (table) => table.get(key));
+    if (!record) return null;
+    if (record.version !== STORAGE_VERSION) return null;
+    if (!record.data || !record.data.meta || !record.data.download) return null;
+    return record.data;
   };
 
-  const saveInfoToCache = (data) => {
+  const saveInfoToCache = async (data) => {
     const key = getCacheKey();
     if (!key) return;
-    if (typeof window === 'undefined' || !window.sessionStorage) return;
-    try {
-      const payload = JSON.stringify({ version: STORAGE_VERSION, timestamp: Date.now(), data });
-      window.sessionStorage.setItem(key, payload);
-    } catch (error) {
-      console.warn('缓存下载信息失败', error);
-    }
+    const payload = {
+      key,
+      version: STORAGE_VERSION,
+      timestamp: Date.now(),
+      data,
+    };
+    await useStorageTable(
+      STORAGE_TABLE_INFO,
+      (table) => table.put(payload),
+      { defaultValue: undefined },
+    );
   };
 
-  const clearInfoCache = () => {
+  const clearInfoCache = async () => {
     const key = getCacheKey();
-    removeInfoCacheByKey(key);
+    await removeInfoCacheByKey(key);
   };
 
   const resetProgressBars = () => {
@@ -706,7 +710,7 @@ const pageScript = String.raw`
       await removePersistedWriterHandle(writerKey);
     }
     if (clearCache && cacheKey) {
-      removeInfoCacheByKey(cacheKey);
+      await removeInfoCacheByKey(cacheKey);
     }
     if (resetProgress) {
       resetProgressBars();
@@ -732,7 +736,7 @@ const pageScript = String.raw`
     const writerKey = state.writerKey;
     purgeSegmentBuffers();
     if (cacheKey) {
-      removeInfoCacheByKey(cacheKey);
+      await removeInfoCacheByKey(cacheKey);
     }
     if (writerKey) {
       await removePersistedWriterHandle(writerKey);
@@ -1155,9 +1159,9 @@ const pageScript = String.raw`
     }
 
     if (forceRefresh) {
-      clearInfoCache();
+      await clearInfoCache();
     } else {
-      const cached = loadInfoFromCache();
+      const cached = await loadInfoFromCache();
       if (cached) {
         applyInfo(cached, { fromCache: true });
         return cached;
@@ -1212,7 +1216,7 @@ const pageScript = String.raw`
         }
         const data = payload.data;
         applyInfo(data);
-        saveInfoToCache(data);
+        await saveInfoToCache(data);
         return data;
       } catch (error) {
         const limit = state.segmentRetryLimit;
@@ -1263,7 +1267,7 @@ const pageScript = String.raw`
       log('本地分段数据已清理');
     }
 
-    clearInfoCache();
+    await clearInfoCache();
     log('本地缓存的 /info 信息已清理');
     setStatus('正在重新获取最新的下载信息...');
     try {
@@ -2316,6 +2320,7 @@ const renderLandingPageHtml = (path) => {
         }
       }
     </style>
+    <script src="https://cdn.jsdelivr.net/npm/dexie@3.2.4/dist/dexie.min.js" crossorigin="anonymous"></script>
     <script src="https://cdn.jsdelivr.net/npm/tweetnacl@1.0.3/nacl-fast.min.js" crossorigin="anonymous"></script>
   </head>
   <body>
