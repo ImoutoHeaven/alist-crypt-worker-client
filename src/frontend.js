@@ -785,7 +785,52 @@ const pageScript = String.raw`
     if (state.writer.type === 'memory' && state.writer.chunks) {
       state.writer.chunks = [];
     }
+    if (state.writer.type === 'fs' && Array.isArray(state.writer.fallbackChunks)) {
+      state.writer.fallbackChunks.length = 0;
+    }
     state.writer = null;
+  };
+
+  const formatFsFallbackMessage = (error, fallbackReason) => {
+    const reason = fallbackReason ? String(fallbackReason) : '未知原因';
+    if (!error) {
+      return reason;
+    }
+    if (error instanceof Error && error.message) {
+      return reason + '：' + error.message;
+    }
+    return reason + '：' + String(error);
+  };
+
+  const fallbackToBlobWriter = async ({ error = null, reason = '', transferChunks = null } = {}) => {
+    let chunks;
+    if (Array.isArray(transferChunks)) {
+      chunks = transferChunks;
+    } else if (state.writer && state.writer.type === 'fs' && Array.isArray(state.writer.fallbackChunks)) {
+      chunks = state.writer.fallbackChunks;
+    } else {
+      chunks = [];
+    }
+    const message = formatFsFallbackMessage(error, reason || '文件系统访问 API 不可用');
+    console.warn('文件系统访问 API 写入失败，回退为 blob 下载：' + message, error);
+    log('文件系统访问不可用，将改为浏览器内下载。原因：' + message);
+    if (state.writerKey) {
+      await removePersistedWriterHandle(state.writerKey);
+    }
+    if (state.writer && state.writer.type === 'fs' && state.writer.writable) {
+      try {
+        if (typeof state.writer.writable.abort === 'function') {
+          await state.writer.writable.abort();
+        } else if (typeof state.writer.writable.close === 'function') {
+          await state.writer.writable.close();
+        }
+      } catch (closeError) {
+        console.warn('在回退过程中关闭文件写入器失败', closeError);
+      }
+    }
+    state.writer = { type: 'memory', chunks };
+    state.writerHandle = null;
+    state.writerKey = '';
   };
 
   const ensureWriter = async (fileName) => {
@@ -819,7 +864,10 @@ const pageScript = String.raw`
         writable = await handle.createWritable({ keepExistingData: false });
       } catch (error) {
         console.warn('使用已保存的文件句柄失败', error);
-        if (!reused) throw error;
+        if (!reused) {
+          await fallbackToBlobWriter({ error, reason: '无法创建文件写入器' });
+          return;
+        }
         if (key) await deleteWriterHandle(key);
         try {
           handle = await window.showSaveFilePicker({
@@ -827,16 +875,23 @@ const pageScript = String.raw`
             types: [{ description: 'Binary file', accept: { 'application/octet-stream': ['.bin'] } }],
           });
         } catch (retryError) {
-          throw new Error('无法重新选择保存位置');
+          await fallbackToBlobWriter({ error: retryError, reason: '无法重新选择保存位置' });
+          return;
         }
         const retryGranted = await ensureHandlePermission(handle);
         if (!retryGranted) {
-          throw new Error('未授予文件写入权限');
+          await fallbackToBlobWriter({ reason: '未授予文件写入权限' });
+          return;
         }
-        writable = await handle.createWritable({ keepExistingData: false });
+        try {
+          writable = await handle.createWritable({ keepExistingData: false });
+        } catch (retryWritableError) {
+          await fallbackToBlobWriter({ error: retryWritableError, reason: '无法创建文件写入器' });
+          return;
+        }
         reused = false;
       }
-      state.writer = { type: 'fs', writable };
+      state.writer = { type: 'fs', writable, fallbackChunks: [] };
       state.writerHandle = handle;
       state.writerKey = key || '';
       if (key) {
@@ -857,19 +912,37 @@ const pageScript = String.raw`
   const writeChunk = async (chunk) => {
     if (!state.writer) throw new Error('writer not initialised');
     if (state.writer.type === 'fs') {
-      await state.writer.writable.write(chunk);
-    } else {
-      state.writer.chunks.push(chunk);
+      if (!Array.isArray(state.writer.fallbackChunks)) {
+        state.writer.fallbackChunks = [];
+      }
+      state.writer.fallbackChunks.push(chunk);
+      try {
+        await state.writer.writable.write(chunk);
+      } catch (error) {
+        await fallbackToBlobWriter({ error, reason: '写入文件失败' });
+      }
+      return;
     }
+    state.writer.chunks.push(chunk);
   };
 
   const finalizeWriter = async () => {
     if (!state.writer) return;
     if (state.writer.type === 'fs') {
-      await state.writer.writable.close();
-      state.writer = null;
-      log('文件已保存到指定位置');
-      return;
+      try {
+        await state.writer.writable.close();
+        if (Array.isArray(state.writer.fallbackChunks)) {
+          state.writer.fallbackChunks.length = 0;
+        }
+        state.writer = null;
+        log('文件已保存到指定位置');
+        return;
+      } catch (error) {
+        await fallbackToBlobWriter({ error, reason: '关闭文件写入器失败' });
+        if (!state.writer || state.writer.type !== 'memory') {
+          throw error;
+        }
+      }
     }
     const blob = new Blob(state.writer.chunks, { type: 'application/octet-stream' });
     const url = URL.createObjectURL(blob);
