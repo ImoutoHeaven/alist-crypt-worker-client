@@ -238,10 +238,12 @@ const pageScript = String.raw`
   };
 
   const STORAGE_DB_NAME = 'alist-crypt-storage';
-  const STORAGE_DB_VERSION = 1;
+  const STORAGE_DB_VERSION = 2;
   const STORAGE_TABLE_SETTINGS = 'settings';
   const STORAGE_TABLE_INFO = 'infoCache';
   const STORAGE_TABLE_HANDLES = 'writerHandles';
+  const STORAGE_TABLE_SEGMENTS = 'segments';
+  const STORAGE_SESSION_FLAG = 'alist-crypt-session-active';
 
   const openStorageDatabase = (() => {
     let promise = null;
@@ -254,11 +256,29 @@ const pageScript = String.raw`
         }
         const DexieClass = window.Dexie;
         const db = new DexieClass(STORAGE_DB_NAME);
-        db.version(STORAGE_DB_VERSION).stores({
+        db.version(1).stores({
           [STORAGE_TABLE_SETTINGS]: '&key',
           [STORAGE_TABLE_INFO]: '&key,timestamp',
           [STORAGE_TABLE_HANDLES]: '&key',
         });
+        db
+          .version(STORAGE_DB_VERSION)
+          .stores({
+            [STORAGE_TABLE_SETTINGS]: '&key',
+            [STORAGE_TABLE_INFO]: '&key,timestamp',
+            [STORAGE_TABLE_HANDLES]: '&key',
+            [STORAGE_TABLE_SEGMENTS]: '[key+index],key',
+          })
+          .upgrade(async (transaction) => {
+            try {
+              const table = transaction.table(STORAGE_TABLE_SEGMENTS);
+              if (table) {
+                await table.clear();
+              }
+            } catch (upgradeError) {
+              console.warn('升级 Dexie 存储结构失败', upgradeError);
+            }
+          });
         return db;
       })().catch((error) => {
         console.warn('初始化 Dexie 存储失败', error);
@@ -268,7 +288,58 @@ const pageScript = String.raw`
     };
   })();
 
+  const ensureSessionIsolation = (() => {
+    let promise = null;
+    return () => {
+      if (promise) return promise;
+      promise = (async () => {
+        if (typeof window === 'undefined') {
+          return;
+        }
+        let hasActiveSession = false;
+        if (window.sessionStorage) {
+          try {
+            hasActiveSession = window.sessionStorage.getItem(STORAGE_SESSION_FLAG) === '1';
+          } catch (error) {
+            console.warn('读取 sessionStorage 状态失败', error);
+          }
+        }
+        if (!hasActiveSession) {
+          const db = await openStorageDatabase();
+          if (db) {
+            const tables = [
+              STORAGE_TABLE_SETTINGS,
+              STORAGE_TABLE_INFO,
+              STORAGE_TABLE_HANDLES,
+              STORAGE_TABLE_SEGMENTS,
+            ];
+            await Promise.all(
+              tables.map(async (tableName) => {
+                try {
+                  await db.table(tableName).clear();
+                } catch (error) {
+                  console.warn('清理 Dexie 表 ' + tableName + ' 失败', error);
+                }
+              }),
+            );
+          }
+        }
+        if (window.sessionStorage) {
+          try {
+            window.sessionStorage.setItem(STORAGE_SESSION_FLAG, '1');
+          } catch (error) {
+            console.warn('写入 sessionStorage 状态失败', error);
+          }
+        }
+      })().catch((error) => {
+        console.warn('初始化会话存储失败', error);
+      });
+      return promise;
+    };
+  })();
+
   const useStorageTable = async (tableName, executor, { defaultValue = null } = {}) => {
+    await ensureSessionIsolation();
     const db = await openStorageDatabase();
     if (!db) return defaultValue;
     try {
@@ -517,6 +588,69 @@ const pageScript = String.raw`
     }
   };
 
+  const buildSegmentSignature = (meta) => {
+    if (!meta) return '';
+    const size = Number(meta.size) || 0;
+    const blockData = Number(meta.blockDataSize) || 0;
+    const blockHeader = Number(meta.blockHeaderSize) || 0;
+    const fileHeader = Number(meta.fileHeaderSize) || 0;
+    return [size, blockData, blockHeader, fileHeader].join(':');
+  };
+
+  const clonePersistedSegment = (value) => {
+    if (!value) return null;
+    if (value instanceof Uint8Array) {
+      return new Uint8Array(value);
+    }
+    if (value instanceof ArrayBuffer) {
+      return new Uint8Array(value.slice(0));
+    }
+    if (ArrayBuffer.isView(value) && value.buffer) {
+      const { buffer, byteOffset, byteLength } = value;
+      return new Uint8Array(buffer.slice(byteOffset, byteOffset + byteLength));
+    }
+    if (value && typeof value === 'object' && value.data) {
+      return clonePersistedSegment(value.data);
+    }
+    return null;
+  };
+
+  const persistSegmentData = async (key, index, data, meta) => {
+    if (!key || !Number.isFinite(index) || !data || data.length === 0) return;
+    const payload = {
+      key,
+      index,
+      signature: buildSegmentSignature(meta),
+      length: data.length,
+      data: data.slice(),
+      timestamp: Date.now(),
+    };
+    await useStorageTable(
+      STORAGE_TABLE_SEGMENTS,
+      (table) => table.put(payload),
+      { defaultValue: undefined },
+    );
+  };
+
+  const loadPersistedSegmentRecords = async (key) => {
+    if (!key) return [];
+    const records = await useStorageTable(
+      STORAGE_TABLE_SEGMENTS,
+      (table) => table.where('key').equals(key).toArray(),
+      { defaultValue: [] },
+    );
+    return Array.isArray(records) ? records : [];
+  };
+
+  const clearSegmentsForKey = async (key) => {
+    if (!key) return;
+    await useStorageTable(
+      STORAGE_TABLE_SEGMENTS,
+      (table) => table.where('key').equals(key).delete(),
+      { defaultValue: undefined },
+    );
+  };
+
   const ensureHandlePermission = async (handle) => {
     if (!handle) return false;
     const ensure = async (mode) => {
@@ -667,6 +801,7 @@ const pageScript = String.raw`
     clearCache = false,
     dropHandles = false,
     resetProgress = true,
+    clearSegments = true,
   } = {}) => {
     const cacheKey = state.cacheKey || getCacheKey();
     const writerKey = state.writerKey;
@@ -712,6 +847,9 @@ const pageScript = String.raw`
     if (clearCache && cacheKey) {
       await removeInfoCacheByKey(cacheKey);
     }
+    if (clearSegments && cacheKey) {
+      await clearSegmentsForKey(cacheKey);
+    }
     if (resetProgress) {
       resetProgressBars();
     }
@@ -737,6 +875,7 @@ const pageScript = String.raw`
     purgeSegmentBuffers();
     if (cacheKey) {
       await removeInfoCacheByKey(cacheKey);
+      await clearSegmentsForKey(cacheKey);
     }
     if (writerKey) {
       await removePersistedWriterHandle(writerKey);
@@ -785,7 +924,52 @@ const pageScript = String.raw`
     if (state.writer.type === 'memory' && state.writer.chunks) {
       state.writer.chunks = [];
     }
+    if (state.writer.type === 'fs' && Array.isArray(state.writer.fallbackChunks)) {
+      state.writer.fallbackChunks.length = 0;
+    }
     state.writer = null;
+  };
+
+  const formatFsFallbackMessage = (error, fallbackReason) => {
+    const reason = fallbackReason ? String(fallbackReason) : '未知原因';
+    if (!error) {
+      return reason;
+    }
+    if (error instanceof Error && error.message) {
+      return reason + '：' + error.message;
+    }
+    return reason + '：' + String(error);
+  };
+
+  const fallbackToBlobWriter = async ({ error = null, reason = '', transferChunks = null } = {}) => {
+    let chunks;
+    if (Array.isArray(transferChunks)) {
+      chunks = transferChunks;
+    } else if (state.writer && state.writer.type === 'fs' && Array.isArray(state.writer.fallbackChunks)) {
+      chunks = state.writer.fallbackChunks;
+    } else {
+      chunks = [];
+    }
+    const message = formatFsFallbackMessage(error, reason || '文件系统访问 API 不可用');
+    console.warn('文件系统访问 API 写入失败，回退为 blob 下载：' + message, error);
+    log('文件系统访问不可用，将改为浏览器内下载。原因：' + message);
+    if (state.writerKey) {
+      await removePersistedWriterHandle(state.writerKey);
+    }
+    if (state.writer && state.writer.type === 'fs' && state.writer.writable) {
+      try {
+        if (typeof state.writer.writable.abort === 'function') {
+          await state.writer.writable.abort();
+        } else if (typeof state.writer.writable.close === 'function') {
+          await state.writer.writable.close();
+        }
+      } catch (closeError) {
+        console.warn('在回退过程中关闭文件写入器失败', closeError);
+      }
+    }
+    state.writer = { type: 'memory', chunks };
+    state.writerHandle = null;
+    state.writerKey = '';
   };
 
   const ensureWriter = async (fileName) => {
@@ -819,7 +1003,10 @@ const pageScript = String.raw`
         writable = await handle.createWritable({ keepExistingData: false });
       } catch (error) {
         console.warn('使用已保存的文件句柄失败', error);
-        if (!reused) throw error;
+        if (!reused) {
+          await fallbackToBlobWriter({ error, reason: '无法创建文件写入器' });
+          return;
+        }
         if (key) await deleteWriterHandle(key);
         try {
           handle = await window.showSaveFilePicker({
@@ -827,16 +1014,23 @@ const pageScript = String.raw`
             types: [{ description: 'Binary file', accept: { 'application/octet-stream': ['.bin'] } }],
           });
         } catch (retryError) {
-          throw new Error('无法重新选择保存位置');
+          await fallbackToBlobWriter({ error: retryError, reason: '无法重新选择保存位置' });
+          return;
         }
         const retryGranted = await ensureHandlePermission(handle);
         if (!retryGranted) {
-          throw new Error('未授予文件写入权限');
+          await fallbackToBlobWriter({ reason: '未授予文件写入权限' });
+          return;
         }
-        writable = await handle.createWritable({ keepExistingData: false });
+        try {
+          writable = await handle.createWritable({ keepExistingData: false });
+        } catch (retryWritableError) {
+          await fallbackToBlobWriter({ error: retryWritableError, reason: '无法创建文件写入器' });
+          return;
+        }
         reused = false;
       }
-      state.writer = { type: 'fs', writable };
+      state.writer = { type: 'fs', writable, fallbackChunks: [] };
       state.writerHandle = handle;
       state.writerKey = key || '';
       if (key) {
@@ -857,19 +1051,37 @@ const pageScript = String.raw`
   const writeChunk = async (chunk) => {
     if (!state.writer) throw new Error('writer not initialised');
     if (state.writer.type === 'fs') {
-      await state.writer.writable.write(chunk);
-    } else {
-      state.writer.chunks.push(chunk);
+      if (!Array.isArray(state.writer.fallbackChunks)) {
+        state.writer.fallbackChunks = [];
+      }
+      state.writer.fallbackChunks.push(chunk);
+      try {
+        await state.writer.writable.write(chunk);
+      } catch (error) {
+        await fallbackToBlobWriter({ error, reason: '写入文件失败' });
+      }
+      return;
     }
+    state.writer.chunks.push(chunk);
   };
 
   const finalizeWriter = async () => {
     if (!state.writer) return;
     if (state.writer.type === 'fs') {
-      await state.writer.writable.close();
-      state.writer = null;
-      log('文件已保存到指定位置');
-      return;
+      try {
+        await state.writer.writable.close();
+        if (Array.isArray(state.writer.fallbackChunks)) {
+          state.writer.fallbackChunks.length = 0;
+        }
+        state.writer = null;
+        log('文件已保存到指定位置');
+        return;
+      } catch (error) {
+        await fallbackToBlobWriter({ error, reason: '关闭文件写入器失败' });
+        if (!state.writer || state.writer.type !== 'memory') {
+          throw error;
+        }
+      }
     }
     const blob = new Blob(state.writer.chunks, { type: 'application/octet-stream' });
     const url = URL.createObjectURL(blob);
@@ -987,49 +1199,85 @@ const pageScript = String.raw`
     state.decrypted = 0;
   };
 
-  const restoreCompletedSegments = (previousSegments, previousMeta, nextMeta) => {
-    if (!Array.isArray(previousSegments) || previousSegments.length === 0) {
+  const restoreCompletedSegments = async (previousSegments, previousMeta, nextMeta) => {
+    if (!nextMeta || state.segments.length === 0) {
+      state.pendingSegments = state.segments.map((segment) => segment.index);
+      state.downloadedEncrypted = 0;
+      state.decrypted = 0;
       return 0;
     }
-    if (!previousMeta || !nextMeta) {
-      return 0;
-    }
+
+    const cacheKey = getCacheKey();
     const comparableKeys = ['blockDataSize', 'blockHeaderSize', 'fileHeaderSize', 'size'];
-    const incompatible = comparableKeys.some((key) => {
-      const prevValue = Number(previousMeta[key]);
-      const nextValue = Number(nextMeta[key]);
-      return Number.isFinite(prevValue) && Number.isFinite(nextValue) && prevValue !== nextValue;
-    });
-    if (incompatible) {
-      return 0;
+    let previousMap = new Map();
+
+    const previousAvailable = Array.isArray(previousSegments) && previousSegments.length > 0 && previousMeta;
+    if (previousAvailable) {
+      const incompatible = comparableKeys.some((key) => {
+        const prevValue = Number(previousMeta[key]);
+        const nextValue = Number(nextMeta[key]);
+        return Number.isFinite(prevValue) && Number.isFinite(nextValue) && prevValue !== nextValue;
+      });
+      if (!incompatible) {
+        previousMap = new Map(
+          previousSegments
+            .filter(
+              (segment) =>
+                segment &&
+                Number.isInteger(segment.index) &&
+                segment.index >= 0 &&
+                segment.encrypted instanceof Uint8Array &&
+                segment.encrypted.length > 0,
+            )
+            .map((segment) => [segment.index, segment.encrypted]),
+        );
+      } else if (cacheKey) {
+        await clearSegmentsForKey(cacheKey);
+      }
     }
-    const previousMap = new Map();
-    previousSegments.forEach((segment) => {
-      if (!segment || !(segment.encrypted instanceof Uint8Array) || segment.encrypted.length === 0) {
-        return;
-      }
-      const key = segment.offset + ':' + segment.length;
-      if (!previousMap.has(key)) {
-        previousMap.set(key, segment);
-      }
-    });
+
+    const persistedMap = new Map();
+    if (cacheKey) {
+      const expectedSignature = buildSegmentSignature(nextMeta);
+      const records = await loadPersistedSegmentRecords(cacheKey);
+      records.forEach((record) => {
+        if (!record || record.signature !== expectedSignature) {
+          return;
+        }
+        const index = Number(record.index);
+        if (!Number.isInteger(index) || index < 0) {
+          return;
+        }
+        const cloned = clonePersistedSegment(record.data);
+        if (cloned && cloned.length > 0) {
+          persistedMap.set(index, cloned);
+        }
+      });
+    }
+
     let reused = 0;
     let encryptedTotal = 0;
     const pending = [];
+
     state.segments.forEach((segment) => {
-      const key = segment.offset + ':' + segment.length;
-      const previous = previousMap.get(key);
       segment.controller = null;
       segment.retries = 0;
-      if (previous) {
-        segment.encrypted = previous.encrypted;
-        encryptedTotal += previous.encrypted.length;
+      let buffer = null;
+      if (persistedMap.has(segment.index)) {
+        buffer = persistedMap.get(segment.index);
+      } else if (previousMap.has(segment.index)) {
+        buffer = previousMap.get(segment.index);
+      }
+      if (buffer && buffer.length > 0) {
+        segment.encrypted = buffer;
+        encryptedTotal += buffer.length;
         reused += 1;
       } else {
         segment.encrypted = null;
         pending.push(segment.index);
       }
     });
+
     state.pendingSegments = pending;
     state.downloadedEncrypted = encryptedTotal;
     state.decrypted = 0;
@@ -1048,7 +1296,7 @@ const pageScript = String.raw`
     return infoUrl;
   };
 
-    const applyInfo = (data, { fromCache = false } = {}) => {
+    const applyInfo = async (data, { fromCache = false } = {}) => {
     if (!data || !data.meta || !data.download) {
       throw new Error('下载信息不完整');
     }
@@ -1108,7 +1356,7 @@ const pageScript = String.raw`
 
     prepareSegments();
     resetProgressBars();
-    const reusedSegments = restoreCompletedSegments(previousSegments, previousMeta, meta);
+    const reusedSegments = await restoreCompletedSegments(previousSegments, previousMeta, meta);
     updateProgress();
     fileNameEl.textContent = meta.fileName || state.infoParams.path.split('/').pop() || '未命名文件';
     state.infoReady = true;
@@ -1163,7 +1411,7 @@ const pageScript = String.raw`
     } else {
       const cached = await loadInfoFromCache();
       if (cached) {
-        applyInfo(cached, { fromCache: true });
+        await applyInfo(cached, { fromCache: true });
         return cached;
       }
     }
@@ -1215,7 +1463,7 @@ const pageScript = String.raw`
           throw fatal;
         }
         const data = payload.data;
-        applyInfo(data);
+        await applyInfo(data);
         await saveInfoToCache(data);
         return data;
       } catch (error) {
@@ -1390,6 +1638,8 @@ const pageScript = String.raw`
         position += chunk.length;
       }
       segment.encrypted = buffer;
+      const cacheKey = getCacheKey();
+      await persistSegmentData(cacheKey, segment.index, buffer, state.meta);
       updateProgress();
     } catch (error) {
       if (received > 0) {
