@@ -22,7 +22,7 @@ const pageScript = String.raw`
   const PARALLEL_STORAGE_KEY = 'alist-crypt-parallelism';
   const DEFAULT_MAX_CONNECTIONS = 4;
   const MIN_CONNECTIONS = 1;
-  const MAX_CONNECTIONS = 32;
+  const MAX_CONNECTIONS = 16;
   const CONNECTION_STORAGE_KEY = 'alist-crypt-max-connections';
   const CANCELLATION_ERROR_NAME = 'DownloadCancelled';
   const $ = (id) => document.getElementById(id);
@@ -113,6 +113,25 @@ const pageScript = String.raw`
   };
 
   const calculateUnderlying = (offset, limit, meta) => {
+    const fallbackLimit = limit >= 0 ? limit : -1;
+    if (
+      !meta ||
+      meta.encryption === 'plain' ||
+      !Number.isFinite(meta.blockDataSize) ||
+      meta.blockDataSize <= 0 ||
+      !Number.isFinite(meta.blockHeaderSize) ||
+      meta.blockHeaderSize <= 0 ||
+      !Number.isFinite(meta.fileHeaderSize) ||
+      meta.fileHeaderSize <= 0
+    ) {
+      return {
+        underlyingOffset: offset,
+        underlyingLimit: fallbackLimit,
+        discard: 0,
+        blocks: 0,
+      };
+    }
+
     const blockData = meta.blockDataSize;
     const blockHeader = meta.blockHeaderSize;
     const headerSize = meta.fileHeaderSize;
@@ -154,6 +173,7 @@ const pageScript = String.raw`
     fileHeaderSize: 0,
     dataKey: null,
     baseNonce: null,
+    encryptionMode: 'crypt',
     segmentRetryLimit: DEFAULT_SEGMENT_RETRY_LIMIT,
     segmentRetryRaw: String(DEFAULT_SEGMENT_RETRY_LIMIT),
     decryptParallelism: DEFAULT_PARALLEL_THREADS,
@@ -594,7 +614,8 @@ const pageScript = String.raw`
     const blockData = Number(meta.blockDataSize) || 0;
     const blockHeader = Number(meta.blockHeaderSize) || 0;
     const fileHeader = Number(meta.fileHeaderSize) || 0;
-    return [size, blockData, blockHeader, fileHeader].join(':');
+    const encryption = meta.encryption === 'plain' ? 'plain' : 'crypt';
+    return [size, blockData, blockHeader, fileHeader, encryption].join(':');
   };
 
   const clonePersistedSegment = (value) => {
@@ -1181,7 +1202,7 @@ const pageScript = String.raw`
       const length = Math.min(segmentSize, state.total - offset);
       const mapping = calculateUnderlying(offset, length, state.meta);
       if (!mapping || mapping.underlyingLimit <= 0) {
-        throw new Error('无法计算有效的加密数据段');
+        throw new Error('无法计算有效的数据段');
       }
       segments.push({
         index,
@@ -1227,7 +1248,7 @@ const pageScript = String.raw`
     }
 
     const cacheKey = getCacheKey();
-    const comparableKeys = ['blockDataSize', 'blockHeaderSize', 'fileHeaderSize', 'size'];
+    const comparableKeys = ['blockDataSize', 'blockHeaderSize', 'fileHeaderSize', 'size', 'encryption'];
     let previousMap = new Map();
 
     const previousAvailable = Array.isArray(previousSegments) && previousSegments.length > 0 && previousMeta;
@@ -1348,6 +1369,7 @@ const pageScript = String.raw`
     const previousSegments = state.segments;
 
     state.meta = meta;
+    state.encryptionMode = meta.encryption === 'plain' ? 'plain' : 'crypt';
     state.remote = {
       url: download.url,
       method: download.method || 'GET',
@@ -1358,8 +1380,8 @@ const pageScript = String.raw`
     state.blockDataSize = Number(meta.blockDataSize) || 0;
     state.blockHeaderSize = Number(meta.blockHeaderSize) || 0;
     state.fileHeaderSize = Number(meta.fileHeaderSize) || 0;
-    state.dataKey = base64ToUint8(meta.dataKey);
-    state.baseNonce = base64ToUint8(meta.nonce);
+    state.dataKey = base64ToUint8(meta.dataKey || '');
+    state.baseNonce = base64ToUint8(meta.nonce || '');
     state.started = false;
     state.paused = false;
     state.mode = 'idle';
@@ -1656,9 +1678,23 @@ const pageScript = String.raw`
         buffer.set(chunk, position);
         position += chunk.length;
       }
-      segment.encrypted = buffer;
+      let payload = buffer;
+      if (state.encryptionMode === 'plain') {
+        const expectedLength = segment.length;
+        if (buffer.length < expectedLength) {
+          throw new Error('远程响应长度不足');
+        }
+        if (buffer.length > expectedLength) {
+          const excess = buffer.length - expectedLength;
+          payload = buffer.subarray(0, expectedLength);
+          state.downloadedEncrypted = Math.max(0, state.downloadedEncrypted - excess);
+          state.bytesSinceSpeedCheck = Math.max(0, state.bytesSinceSpeedCheck - excess);
+          updateProgress();
+        }
+      }
+      segment.encrypted = payload;
       const cacheKey = getCacheKey();
-      await persistSegmentData(cacheKey, segment.index, buffer, state.meta);
+      await persistSegmentData(cacheKey, segment.index, payload, state.meta);
       updateProgress();
     } catch (error) {
       if (received > 0) {
@@ -1793,10 +1829,13 @@ const pageScript = String.raw`
 
   const decryptSegmentData = async (segment) => {
     if (!segment || !segment.encrypted) {
-      throw new Error('缺少加密数据');
+      throw new Error('缺少分段数据');
     }
     if (isCancelled()) {
       throw createCancellationError();
+    }
+    if (state.encryptionMode === 'plain') {
+      return segment.encrypted;
     }
     const buffer = segment.encrypted;
     const totalNeeded = segment.length;
@@ -1986,12 +2025,39 @@ const pageScript = String.raw`
     }
   };
 
+  const writePlainSegments = async () => {
+    const totalSegments = state.segments.length;
+    for (let i = 0; i < totalSegments; i += 1) {
+      if (isCancelled()) {
+        throw createCancellationError();
+      }
+      if (state.paused) {
+        await waitWhilePaused();
+      }
+      const segment = state.segments[i];
+      if (!segment || !(segment.encrypted instanceof Uint8Array)) {
+        throw new Error('缺少分段数据，请重试下载');
+      }
+      await writeChunk(segment.encrypted);
+      state.decrypted = Math.min(state.total, state.decrypted + segment.encrypted.length);
+      updateProgress();
+      segment.encrypted = null;
+      if (state.decrypted < state.total) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    }
+  };
+
   const startWorkflow = async () => {
     if (state.workflowPromise) return;
     state.workflowPromise = (async () => {
       try {
         if (!state.infoReady) return;
-        if (!window.nacl || !window.nacl.secretbox || !window.nacl.secretbox.open) {
+        const isCrypt = state.encryptionMode !== 'plain';
+        if (
+          isCrypt &&
+          (!window.nacl || !window.nacl.secretbox || !window.nacl.secretbox.open)
+        ) {
           throw new Error('TweetNaCl 初始化失败，请刷新页面重试');
         }
         resetCancellation();
@@ -2024,21 +2090,26 @@ const pageScript = String.raw`
         state.paused = false;
         updateToggleLabel();
         toggleBtn.disabled = false;
-        const configuredParallel = clampParallelThreads(
-          Number.isFinite(state.decryptParallelism) ? state.decryptParallelism : DEFAULT_PARALLEL_THREADS,
-        );
-        const effectiveParallel = resolveParallelism();
-        if (effectiveParallel < configuredParallel) {
-          log(
-            '浏览器可用线程数限制为 ' +
-              effectiveParallel +
-              ' 条，已从配置的 ' +
-              configuredParallel +
-              ' 条线程进行调整',
+        if (isCrypt) {
+          const configuredParallel = clampParallelThreads(
+            Number.isFinite(state.decryptParallelism) ? state.decryptParallelism : DEFAULT_PARALLEL_THREADS,
           );
+          const effectiveParallel = resolveParallelism();
+          if (effectiveParallel < configuredParallel) {
+            log(
+              '浏览器可用线程数限制为 ' +
+                effectiveParallel +
+                ' 条，已从配置的 ' +
+                configuredParallel +
+                ' 条线程进行调整',
+            );
+          }
+          setStatus('所有分段下载完成，开始解密（并行 ' + effectiveParallel + ' 线程）');
+          await decryptAllSegments(effectiveParallel);
+        } else {
+          setStatus('所有分段下载完成，开始写入文件');
+          await writePlainSegments();
         }
-        setStatus('所有分段下载完成，开始解密（并行 ' + effectiveParallel + ' 线程）');
-        await decryptAllSegments(effectiveParallel);
         state.decrypted = state.total;
         updateProgress();
         await finalizeWriter();

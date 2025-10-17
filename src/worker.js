@@ -8,6 +8,9 @@ import { renderLandingPage } from './frontend.js';
 
 const REQUIRED_ENV = ['ADDRESS', 'TOKEN'];
 
+const MAX_CONNECTIONS = 16;
+const MIN_CONNECTIONS = 1;
+
 const hopByHopHeaders = new Set([
   'connection',
   'keep-alive',
@@ -268,6 +271,7 @@ const handleInfo = async (request, config) => {
 
   const clientIP = request.headers.get('CF-Connecting-IP') || '';
   const meta = await fetchCryptMeta(config, path, clientIP);
+  const mode = meta && meta.mode === 'plain' ? 'plain' : 'crypt';
   const verifyCandidates = collectVerifyCandidates(path, meta);
   const verifyResult = await verifyWithCandidates(config.signSecret, sign, verifyCandidates);
   if (verifyResult) {
@@ -275,8 +279,32 @@ const handleInfo = async (request, config) => {
   }
 
   const remoteHeaders = sanitizeUpstreamHeaders(cloneRemoteHeaders(meta.remote?.headers));
-  const headerBytes = await fetchEncryptedHeader(meta, remoteHeaders);
-  const nonce = extractNonceFromHeader(headerBytes, meta.file_header_size);
+  let nonceBase64 = '';
+  const numericBlockDataSize = Number(meta.block_data_size);
+  const numericBlockHeaderSize = Number(meta.block_header_size);
+  const numericFileHeaderSize = Number(meta.file_header_size);
+  let blockDataSize = Number.isFinite(numericBlockDataSize) ? numericBlockDataSize : 0;
+  let blockHeaderSize = Number.isFinite(numericBlockHeaderSize) ? numericBlockHeaderSize : 0;
+  let fileHeaderSize = Number.isFinite(numericFileHeaderSize) ? numericFileHeaderSize : 0;
+  let dataKey = typeof meta.data_key === 'string' ? meta.data_key : '';
+  let suggestedConnections = '';
+  if (mode === 'crypt') {
+    const headerBytes = await fetchEncryptedHeader(meta, remoteHeaders);
+    const nonce = extractNonceFromHeader(headerBytes, fileHeaderSize);
+    nonceBase64 = uint8ToBase64(nonce);
+  } else {
+    blockDataSize = 0;
+    blockHeaderSize = 0;
+    fileHeaderSize = 0;
+    dataKey = '';
+  }
+  const remoteConcurrency = Number(meta.remote?.concurrency);
+  if (Number.isFinite(remoteConcurrency) && remoteConcurrency > 0) {
+    const clamped = Math.max(MIN_CONNECTIONS, Math.min(MAX_CONNECTIONS, Math.floor(remoteConcurrency)));
+    if (clamped >= MIN_CONNECTIONS) {
+      suggestedConnections = String(clamped);
+    }
+  }
 
   const responsePayload = {
     code: 200,
@@ -291,14 +319,16 @@ const handleInfo = async (request, config) => {
         path,
         size: meta.size,
         fileName: meta.file_name,
-        blockDataSize: meta.block_data_size,
-        blockHeaderSize: meta.block_header_size,
-        fileHeaderSize: meta.file_header_size,
-        dataKey: meta.data_key,
-        nonce: uint8ToBase64(nonce),
+        blockDataSize,
+        blockHeaderSize,
+        fileHeaderSize,
+        dataKey,
+        nonce: nonceBase64,
+        encryption: mode,
       },
       settings: {
         segmentRetry: retry,
+        maxConnections: suggestedConnections ? Number(suggestedConnections) : undefined,
       },
     },
   };
