@@ -46,6 +46,8 @@ const pageScript = String.raw`
   const clearEnvBtn = $('clearEnvBtn');
   const cancelBtn = $('cancelBtn');
   const logEl = $('log');
+  const turnstileContainer = $('turnstileContainer');
+  const turnstileMessage = $('turnstileMessage');
 
   const log = (message) => {
     const time = new Date().toLocaleTimeString();
@@ -198,7 +200,184 @@ const pageScript = String.raw`
     writerKey: '',
     workflowPromise: null,
     cancelled: false,
+    security: {
+      underAttack: false,
+      siteKey: '',
+      scriptLoaded: false,
+      scriptLoading: null,
+      widgetId: null,
+      token: '',
+      tokenIssuedAt: 0,
+      tokenResolvers: [],
+    },
   };
+
+  const setTurnstileMessage = (text) => {
+    if (!turnstileMessage) return;
+    if (text) {
+      turnstileMessage.textContent = text;
+      turnstileMessage.hidden = false;
+    } else {
+      turnstileMessage.textContent = '';
+      turnstileMessage.hidden = true;
+    }
+  };
+
+  const showTurnstileContainer = () => {
+    if (!turnstileContainer) return;
+    turnstileContainer.hidden = false;
+    turnstileContainer.classList.add('is-visible');
+  };
+
+  const hideTurnstileContainer = () => {
+    if (!turnstileContainer) return;
+    turnstileContainer.hidden = true;
+    turnstileContainer.classList.remove('is-visible');
+  };
+
+  const fulfilTurnstileResolvers = (token) => {
+    const resolvers = state.security.tokenResolvers.splice(0, state.security.tokenResolvers.length);
+    resolvers.forEach((resolver) => {
+      try {
+        resolver(token);
+      } catch (error) {
+        console.error('Turnstile resolver failed', error);
+      }
+    });
+  };
+
+  const clearTurnstileToken = () => {
+    state.security.token = '';
+    state.security.tokenIssuedAt = 0;
+  };
+
+  const SECURITY_SCRIPT_SRC = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+
+  const ensureTurnstileScript = () => {
+    if (!state.security.underAttack) return Promise.resolve();
+    if (state.security.scriptLoaded) return Promise.resolve();
+    if (state.security.scriptLoading) return state.security.scriptLoading;
+    state.security.scriptLoading = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = SECURITY_SCRIPT_SRC;
+      script.async = true;
+      script.defer = true;
+      script.onload = () => {
+        state.security.scriptLoaded = true;
+        state.security.scriptLoading = null;
+        resolve();
+      };
+      script.onerror = () => {
+        state.security.scriptLoading = null;
+        reject(new Error('Turnstile 脚本加载失败'));
+      };
+      document.head.appendChild(script);
+    });
+    return state.security.scriptLoading;
+  };
+
+  const renderTurnstileWidget = async () => {
+    if (!state.security.underAttack) return;
+    await ensureTurnstileScript();
+    if (!turnstileContainer) {
+      throw new Error('缺少 Turnstile 容器');
+    }
+    if (!window.turnstile || typeof window.turnstile.render !== 'function') {
+      throw new Error('Turnstile 未初始化');
+    }
+    showTurnstileContainer();
+    if (state.security.widgetId !== null) {
+      return;
+    }
+    turnstileContainer.innerHTML = '';
+    setTurnstileMessage('请完成验证后继续下载');
+    state.security.widgetId = window.turnstile.render(turnstileContainer, {
+      sitekey: state.security.siteKey,
+      theme: 'dark',
+      execution: 'render',
+      callback: (token) => {
+        state.security.token = token || '';
+        state.security.tokenIssuedAt = Date.now();
+        setTurnstileMessage('验证完成，可以继续操作');
+        fulfilTurnstileResolvers(state.security.token);
+      },
+      'expired-callback': () => {
+        clearTurnstileToken();
+        setTurnstileMessage('验证已过期，请重新验证');
+      },
+      'error-callback': () => {
+        clearTurnstileToken();
+        setTurnstileMessage('验证失败，请重试');
+        if (typeof window.turnstile.reset === 'function' && state.security.widgetId !== null) {
+          try {
+            window.turnstile.reset(state.security.widgetId);
+          } catch (error) {
+            console.warn('Turnstile reset 失败', error);
+          }
+        }
+      },
+    });
+  };
+
+  const waitForTurnstileToken = async () => {
+    if (!state.security.underAttack) return '';
+    if (!state.security.siteKey) {
+      throw new Error('缺少 Turnstile site key');
+    }
+    await renderTurnstileWidget();
+    if (!state.security.token) {
+      showTurnstileContainer();
+      setTurnstileMessage('请完成验证后继续下载');
+    }
+    if (state.security.token) {
+      return state.security.token;
+    }
+    return new Promise((resolve) => {
+      state.security.tokenResolvers.push(resolve);
+    });
+  };
+
+  const consumeTurnstileToken = ({ hide = false } = {}) => {
+    if (!state.security.underAttack) return;
+    clearTurnstileToken();
+    if (typeof window.turnstile?.reset === 'function' && state.security.widgetId !== null) {
+      try {
+        window.turnstile.reset(state.security.widgetId);
+      } catch (error) {
+        console.warn('Turnstile reset 失败', error);
+      }
+    }
+    if (hide) {
+      hideTurnstileContainer();
+      setTurnstileMessage('');
+    } else {
+      showTurnstileContainer();
+      setTurnstileMessage('请完成验证后继续下载');
+    }
+  };
+
+  const securityConfig =
+    typeof window !== 'undefined' && window.__ALIST_SECURITY__ && typeof window.__ALIST_SECURITY__ === 'object'
+      ? window.__ALIST_SECURITY__
+      : {};
+  state.security.underAttack = securityConfig.underAttack === true;
+  state.security.siteKey =
+    typeof securityConfig.turnstileSiteKey === 'string' ? securityConfig.turnstileSiteKey.trim() : '';
+  if (!state.security.siteKey) {
+    state.security.underAttack = false;
+  }
+  if (!state.security.underAttack) {
+    clearTurnstileToken();
+    hideTurnstileContainer();
+  } else {
+    if (turnstileContainer) {
+      showTurnstileContainer();
+    }
+    setTurnstileMessage('请完成验证后继续下载');
+    if (toggleBtn) {
+      toggleBtn.textContent = '等待验证';
+    }
+  }
 
   const createCancellationError = () => {
     const error = new Error('下载已取消');
@@ -1365,6 +1544,19 @@ const pageScript = String.raw`
         }
       }
     }
+    if (data.settings && typeof data.settings.underAttack === 'boolean') {
+      const enforced = data.settings.underAttack === true;
+      if (!enforced) {
+        state.security.underAttack = false;
+        clearTurnstileToken();
+        hideTurnstileContainer();
+        setTurnstileMessage('');
+      } else if (!state.security.siteKey) {
+        log('worker 指定开启 Turnstile，但缺少 site key 配置');
+      } else {
+        state.security.underAttack = true;
+      }
+    }
     const previousMeta = state.meta;
     const previousSegments = state.segments;
 
@@ -1460,9 +1652,21 @@ const pageScript = String.raw`
     const infoUrl = buildInfoUrl();
     let retries = 0;
     while (true) {
+      let turnstileToken = '';
+      let requestSucceeded = false;
       try {
+        if (state.security.underAttack) {
+          turnstileToken = await waitForTurnstileToken();
+          if (!turnstileToken) {
+            throw new Error('人机验证未完成');
+          }
+        }
+        const headers = { Accept: 'application/json' };
+        if (turnstileToken) {
+          headers['cf-turnstile-response'] = turnstileToken;
+        }
         const response = await fetch(infoUrl.toString(), {
-          headers: { Accept: 'application/json' },
+          headers,
         });
         if (!response.ok) {
           const status = response.status;
@@ -1485,6 +1689,9 @@ const pageScript = String.raw`
             console.warn('读取 /info 错误响应失败', readError);
           }
           const cleaned = messageText ? messageText.trim() : '';
+          if (status === 403 && state.security.underAttack) {
+            setTurnstileMessage(cleaned || '验证失败，请重试');
+          }
           const finalMessage = cleaned
             ? cleaned + '（HTTP ' + status + '）'
             : '获取信息失败，HTTP ' + status;
@@ -1506,6 +1713,7 @@ const pageScript = String.raw`
         const data = payload.data;
         await applyInfo(data);
         await saveInfoToCache(data);
+        requestSucceeded = true;
         return data;
       } catch (error) {
         const limit = state.segmentRetryLimit;
@@ -1523,6 +1731,10 @@ const pageScript = String.raw`
           : '第 ' + retries + ' 次重试（无限重试）';
         setStatus('/info 请求失败：' + message + '，' + Math.round(RETRY_DELAY_MS / 1000) + ' 秒后重试，' + retryLabel + '。');
         await sleep(RETRY_DELAY_MS);
+      } finally {
+        if (state.security.underAttack && turnstileToken) {
+          consumeTurnstileToken({ hide: requestSucceeded });
+        }
       }
     }
   };
@@ -2412,7 +2624,7 @@ const pageScript = String.raw`
 
   const initialise = async () => {
     toggleBtn.disabled = true;
-    toggleBtn.textContent = '加载中';
+    toggleBtn.textContent = state.security.underAttack ? '等待验证' : '加载中';
     retryBtn.disabled = true;
     clearCacheBtn.disabled = true;
     clearEnvBtn.disabled = true;
@@ -2432,10 +2644,18 @@ const pageScript = String.raw`
 })();
 `;
 
-const renderLandingPageHtml = (path) => {
+const renderLandingPageHtml = (path, options = {}) => {
+  const normalizedOptions =
+    options && typeof options === 'object' && !Array.isArray(options) ? options : {};
   const display = path && path !== '/' ? decodeURIComponent(path) : '文件下载';
   const title = escapeHtml(display);
   const script = pageScript.replace(/<\/script>/g, '<\\/script>');
+  const securityConfig = {
+    underAttack: normalizedOptions.underAttack === true,
+    turnstileSiteKey:
+      typeof normalizedOptions.turnstileSiteKey === 'string' ? normalizedOptions.turnstileSiteKey : '',
+  };
+  const securityJson = JSON.stringify(securityConfig).replace(/</g, '\\u003c');
 
   return `
 <!DOCTYPE html>
@@ -2506,6 +2726,26 @@ const renderLandingPageHtml = (path) => {
         flex-wrap: wrap;
         gap: 0.5rem;
         margin: 1.5rem 0;
+      }
+      .turnstile-section {
+        margin: 1.5rem 0 0;
+      }
+      .turnstile-container {
+        display: none;
+        padding: 1rem;
+        background: rgba(56,189,248,0.08);
+        border-radius: 0.75rem;
+      }
+      .turnstile-container.is-visible {
+        display: block;
+      }
+      .turnstile-message {
+        margin-top: 0.75rem;
+        font-size: 0.85rem;
+        color: #fbbf24;
+      }
+      .turnstile-message[hidden] {
+        display: none;
       }
       button {
         cursor: pointer;
@@ -2679,6 +2919,10 @@ const renderLandingPageHtml = (path) => {
         <div class="bar"><span id="decryptBar"></span></div>
         <div class="value" id="decryptText">0%</div>
       </section>
+      <section class="turnstile-section" id="turnstileSection">
+        <div id="turnstileContainer" class="turnstile-container" hidden></div>
+        <div id="turnstileMessage" class="turnstile-message" hidden></div>
+      </section>
       <div class="status">当前速度：<span id="speedText">--</span></div>
       <div class="controls">
         <button id="toggleBtn" disabled>加载中</button>
@@ -2719,6 +2963,9 @@ const renderLandingPageHtml = (path) => {
         <div class="log" id="log"></div>
       </section>
     </main>
+    <script>
+      window.__ALIST_SECURITY__ = ${securityJson};
+    </script>
     <script type="module">
       ${script}
     </script>
@@ -2726,8 +2973,10 @@ const renderLandingPageHtml = (path) => {
 </html>`;
 };
 
-export const renderLandingPage = (path) => {
-  const html = renderLandingPageHtml(path);
+export const renderLandingPage = (path, options = {}) => {
+  const normalizedOptions =
+    options && typeof options === 'object' && !Array.isArray(options) ? options : {};
+  const html = renderLandingPageHtml(path, normalizedOptions);
   return new Response(html, {
     status: 200,
     headers: {

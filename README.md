@@ -13,6 +13,11 @@ Worker variant that keeps server-side logic to authentication, metadata retrieva
 | `VERIFY_SECRET` | ⛔ optional | Extra header value for upstream verification. |
 | `IPV4_ONLY` | ⛔ optional | Set to `"true"` to block IPv6 clients. |
 | `SESSION_TTL_SECONDS` | ⛔ optional | Lifetime of metadata sessions shared with `/fetch`; defaults to `300`. |
+| `UNDER_ATTACK` | ⛔ optional | Set to `"true"` to require human verification before downloads continue. |
+| `TURNSTILE_SITE_KEY` | ⚠️ required when `UNDER_ATTACK=true` | Cloudflare Turnstile site key exposed to the browser. |
+| `TURNSTILE_SECRET_KEY` | ⚠️ required when `UNDER_ATTACK=true` | Cloudflare Turnstile secret used by the Worker to verify tokens. |
+
+When `UNDER_ATTACK` is enabled the Worker enforces Cloudflare Turnstile checks on the `/info` metadata endpoint. The public site key must be supplied to the client, and the secret key stays server-side to validate submitted tokens through the Turnstile `siteverify` API.
 
 ## Endpoints
 

@@ -11,6 +11,9 @@ const REQUIRED_ENV = ['ADDRESS', 'TOKEN'];
 const MAX_CONNECTIONS = 16;
 const MIN_CONNECTIONS = 1;
 
+const TURNSTILE_VERIFY_ENDPOINT = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
+const TURNSTILE_HEADER = 'cf-turnstile-response';
+
 const hopByHopHeaders = new Set([
   'connection',
   'keep-alive',
@@ -34,6 +37,12 @@ const ensureRequiredEnv = (env) => {
 
 const resolveConfig = (env = {}) => {
   ensureRequiredEnv(env);
+  const underAttack = parseBoolean(env.UNDER_ATTACK, false);
+  const turnstileSiteKey = env.TURNSTILE_SITE_KEY ? String(env.TURNSTILE_SITE_KEY).trim() : '';
+  const turnstileSecretKey = env.TURNSTILE_SECRET_KEY ? String(env.TURNSTILE_SECRET_KEY).trim() : '';
+  if (underAttack && (!turnstileSiteKey || !turnstileSecretKey)) {
+    throw new Error('environment variables TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY are required when UNDER_ATTACK is true');
+  }
   return {
     address: env.ADDRESS,
     token: env.TOKEN,
@@ -41,7 +50,47 @@ const resolveConfig = (env = {}) => {
     verifySecret: env.VERIFY_SECRET || '',
     ipv4Only: parseBoolean(env.IPV4_ONLY, false),
     signSecret: env.SIGN_SECRET && env.SIGN_SECRET.trim() !== '' ? env.SIGN_SECRET : env.TOKEN,
+    underAttack,
+    turnstileSiteKey,
+    turnstileSecretKey,
   };
+};
+
+const verifyTurnstileToken = async (secretKey, token, remoteIP) => {
+  if (!token) {
+    return { ok: false, message: 'turnstile token missing' };
+  }
+  if (!secretKey) {
+    return { ok: false, message: 'turnstile secret missing' };
+  }
+  const payload = new URLSearchParams();
+  payload.set('secret', secretKey);
+  payload.set('response', token);
+  if (remoteIP) {
+    payload.set('remoteip', remoteIP);
+  }
+  const response = await fetch(TURNSTILE_VERIFY_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+    },
+    body: payload,
+  });
+  if (!response.ok) {
+    return { ok: false, message: `turnstile verify http ${response.status}` };
+  }
+  let result;
+  try {
+    result = await response.json();
+  } catch (error) {
+    return { ok: false, message: 'turnstile verify parse failed' };
+  }
+  if (!result.success) {
+    const errorCodes = Array.isArray(result['error-codes']) ? result['error-codes'] : [];
+    const reason = errorCodes.length > 0 ? String(errorCodes[0]) : 'turnstile verification failed';
+    return { ok: false, message: reason };
+  }
+  return { ok: true };
 };
 
 const hmacSha256Sign = async (secret, data, expire) => {
@@ -270,6 +319,22 @@ const handleInfo = async (request, config) => {
   }
 
   const clientIP = request.headers.get('CF-Connecting-IP') || '';
+  if (config.underAttack) {
+    const token =
+      request.headers.get(TURNSTILE_HEADER) ||
+      request.headers.get('x-turnstile-token') ||
+      url.searchParams.get(TURNSTILE_HEADER) ||
+      url.searchParams.get('turnstile_token') ||
+      '';
+    if (!token) {
+      return respondJson(origin, { code: 461, message: 'turnstile token required' }, 403);
+    }
+    const verification = await verifyTurnstileToken(config.turnstileSecretKey, token, clientIP);
+    if (!verification.ok) {
+      return respondJson(origin, { code: 462, message: verification.message || 'turnstile verification failed' }, 403);
+    }
+  }
+
   const meta = await fetchCryptMeta(config, path, clientIP);
   const mode = meta && meta.mode === 'plain' ? 'plain' : 'crypt';
   const verifyCandidates = collectVerifyCandidates(path, meta);
@@ -329,13 +394,14 @@ const handleInfo = async (request, config) => {
       settings: {
         segmentRetry: retry,
         maxConnections: suggestedConnections ? Number(suggestedConnections) : undefined,
+        underAttack: config.underAttack,
       },
     },
   };
   return respondJson(origin, responsePayload, 200);
 };
 
-const handleFileRequest = async (request) => {
+const handleFileRequest = async (request, config) => {
   if (request.method !== 'GET' && request.method !== 'HEAD') {
     return respondJson(request.headers.get('origin') || '*', { code: 405, message: 'method not allowed' }, 405);
   }
@@ -349,7 +415,10 @@ const handleFileRequest = async (request) => {
     });
   }
   const url = new URL(request.url);
-  return renderLandingPage(url.pathname);
+  return renderLandingPage(url.pathname, {
+    underAttack: config.underAttack,
+    turnstileSiteKey: config.turnstileSiteKey,
+  });
 };
 
 const routeRequest = async (request, config) => {
@@ -363,7 +432,7 @@ const routeRequest = async (request, config) => {
   if (request.method === 'GET' && pathname === '/info') {
     return handleInfo(request, config);
   }
-  return handleFileRequest(request);
+  return handleFileRequest(request, config);
 };
 
 export default {
