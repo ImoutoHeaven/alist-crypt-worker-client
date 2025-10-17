@@ -1732,21 +1732,35 @@ const pageScript = String.raw`
           if (status === 403 && state.security.underAttack) {
             setTurnstileMessage(cleaned || '验证失败，请重试');
           }
-          const finalMessage = cleaned
-            ? cleaned + '（HTTP ' + status + '）'
-            : '获取信息失败，HTTP ' + status;
+          const finalMessage =
+            status === 401
+              ? cleaned
+                ? cleaned + '（HTTP 401）'
+                : '获取信息失败：凭证已失效，请刷新页面重新验证（HTTP 401）'
+              : cleaned
+                ? cleaned + '（HTTP ' + status + '）'
+                : '获取信息失败，HTTP ' + status;
           const fatal = new Error(finalMessage);
           if (status === 410) {
             markNonRetryable(fatal, 'http410');
+          }
+          if (status === 401) {
+            markNonRetryable(fatal, 'http401');
           }
           throw fatal;
         }
         const payload = await response.json();
         if (payload.code !== 200 || !payload.data) {
-          const finalMessage = payload.message || '接口返回异常';
+          const finalMessage =
+            payload.code === 401 && !payload.message
+              ? '接口返回异常：凭证已失效，请刷新页面重新验证'
+              : payload.message || '接口返回异常';
           const fatal = new Error(finalMessage);
           if (payload.code === 410) {
             markNonRetryable(fatal, 'code410');
+          }
+          if (payload.code === 401) {
+            markNonRetryable(fatal, 'code401');
           }
           throw fatal;
         }
@@ -1884,6 +1898,10 @@ const pageScript = String.raw`
         const baseMessage = '远程响应状态 ' + status;
         if (status === 410) {
           const fatal = markNonRetryable(new Error('远程签名已过期或失效（HTTP 410），请重新生成链接'));
+          throw fatal;
+        }
+        if (status === 401) {
+          const fatal = markNonRetryable(new Error('远程权限已失效（HTTP 401），请刷新页面重新获取下载信息'));
           throw fatal;
         }
         throw new Error(baseMessage);
