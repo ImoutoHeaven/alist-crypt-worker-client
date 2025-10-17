@@ -200,6 +200,8 @@ const pageScript = String.raw`
     writerKey: '',
     workflowPromise: null,
     cancelled: false,
+    redirectPlainDownload: false,
+    redirectPlainActive: false,
     security: {
       underAttack: false,
       siteKey: '',
@@ -209,6 +211,7 @@ const pageScript = String.raw`
       token: '',
       tokenIssuedAt: 0,
       tokenResolvers: [],
+      bypassForCachedInfo: false,
     },
   };
 
@@ -235,6 +238,23 @@ const pageScript = String.raw`
     turnstileContainer.classList.remove('is-visible');
   };
 
+  const shouldEnforceTurnstile = () =>
+    state.security.underAttack === true && state.security.bypassForCachedInfo !== true;
+
+  const syncTurnstilePrompt = () => {
+    if (!shouldEnforceTurnstile()) {
+      hideTurnstileContainer();
+      if (!state.security.token) {
+        setTurnstileMessage('');
+      }
+      return;
+    }
+    showTurnstileContainer();
+    if (!state.security.token) {
+      setTurnstileMessage('请完成验证后继续下载');
+    }
+  };
+
   const fulfilTurnstileResolvers = (token) => {
     const resolvers = state.security.tokenResolvers.splice(0, state.security.tokenResolvers.length);
     resolvers.forEach((resolver) => {
@@ -254,7 +274,7 @@ const pageScript = String.raw`
   const SECURITY_SCRIPT_SRC = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
 
   const ensureTurnstileScript = () => {
-    if (!state.security.underAttack) return Promise.resolve();
+    if (!shouldEnforceTurnstile()) return Promise.resolve();
     if (state.security.scriptLoaded) return Promise.resolve();
     if (state.security.scriptLoading) return state.security.scriptLoading;
     state.security.scriptLoading = new Promise((resolve, reject) => {
@@ -277,7 +297,11 @@ const pageScript = String.raw`
   };
 
   const renderTurnstileWidget = async () => {
-    if (!state.security.underAttack) return;
+    if (!shouldEnforceTurnstile()) {
+      hideTurnstileContainer();
+      setTurnstileMessage('');
+      return;
+    }
     await ensureTurnstileScript();
     if (!turnstileContainer) {
       throw new Error('缺少 Turnstile 容器');
@@ -320,7 +344,7 @@ const pageScript = String.raw`
   };
 
   const waitForTurnstileToken = async () => {
-    if (!state.security.underAttack) return '';
+    if (!shouldEnforceTurnstile()) return '';
     if (!state.security.siteKey) {
       throw new Error('缺少 Turnstile site key');
     }
@@ -338,7 +362,7 @@ const pageScript = String.raw`
   };
 
   const consumeTurnstileToken = ({ hide = false } = {}) => {
-    if (!state.security.underAttack) return;
+    if (!shouldEnforceTurnstile()) return;
     clearTurnstileToken();
     if (typeof window.turnstile?.reset === 'function' && state.security.widgetId !== null) {
       try {
@@ -360,6 +384,9 @@ const pageScript = String.raw`
     typeof window !== 'undefined' && window.__ALIST_SECURITY__ && typeof window.__ALIST_SECURITY__ === 'object'
       ? window.__ALIST_SECURITY__
       : {};
+  state.security.bypassForCachedInfo = false;
+  state.redirectPlainDownload = securityConfig.redirectPlainDownload === true;
+  state.redirectPlainActive = false;
   state.security.underAttack = securityConfig.underAttack === true;
   state.security.siteKey =
     typeof securityConfig.turnstileSiteKey === 'string' ? securityConfig.turnstileSiteKey.trim() : '';
@@ -368,15 +395,10 @@ const pageScript = String.raw`
   }
   if (!state.security.underAttack) {
     clearTurnstileToken();
-    hideTurnstileContainer();
-  } else {
-    if (turnstileContainer) {
-      showTurnstileContainer();
-    }
-    setTurnstileMessage('请完成验证后继续下载');
-    if (toggleBtn) {
-      toggleBtn.textContent = '等待验证';
-    }
+  }
+  syncTurnstilePrompt();
+  if (toggleBtn && shouldEnforceTurnstile()) {
+    toggleBtn.textContent = '等待验证';
   }
 
   const createCancellationError = () => {
@@ -978,7 +1000,7 @@ const pageScript = String.raw`
 
   const updateToggleLabel = () => {
     if (!state.started || state.mode === 'idle') {
-      toggleBtn.textContent = '开始下载';
+      toggleBtn.textContent = state.redirectPlainActive ? '跳转下载' : '开始下载';
       return;
     }
     if (state.mode === 'downloading') {
@@ -1033,6 +1055,9 @@ const pageScript = String.raw`
       state.downloadedEncrypted = 0;
       state.decrypted = 0;
       state.infoReady = false;
+      state.redirectPlainActive = false;
+      state.security.bypassForCachedInfo = false;
+      syncTurnstilePrompt();
       state.meta = null;
       state.remote = null;
       state.dataKey = null;
@@ -1081,6 +1106,9 @@ const pageScript = String.raw`
       await removePersistedWriterHandle(writerKey);
     }
     state.infoReady = false;
+    state.redirectPlainActive = false;
+    state.security.bypassForCachedInfo = false;
+    syncTurnstilePrompt();
     resetCancellation();
     if (cancelBtn) {
       cancelBtn.disabled = true;
@@ -1557,11 +1585,18 @@ const pageScript = String.raw`
         state.security.underAttack = true;
       }
     }
+    if (fromCache && state.security.underAttack) {
+      state.security.bypassForCachedInfo = true;
+    } else {
+      state.security.bypassForCachedInfo = false;
+    }
+    syncTurnstilePrompt();
     const previousMeta = state.meta;
     const previousSegments = state.segments;
 
     state.meta = meta;
     state.encryptionMode = meta.encryption === 'plain' ? 'plain' : 'crypt';
+    state.redirectPlainActive = state.redirectPlainDownload && state.encryptionMode === 'plain';
     state.remote = {
       url: download.url,
       method: download.method || 'GET',
@@ -1602,11 +1637,13 @@ const pageScript = String.raw`
       cancelBtn.disabled = true;
     }
     logEl.innerHTML = '';
-    const statusMessage = fromCache
-      ? '已从缓存恢复下载信息，随时可以开始下载。'
-      : reusedSegments > 0
-        ? '信息获取成功，已保留 ' + reusedSegments + ' 个已完成分段，可继续下载。'
-        : '信息获取成功，可以开始下载。';
+    const statusMessage = state.redirectPlainActive
+      ? '信息获取成功，可直接跳转至源文件下载。'
+      : fromCache
+        ? '已从缓存恢复下载信息，随时可以开始下载。'
+        : reusedSegments > 0
+          ? '信息获取成功，已保留 ' + reusedSegments + ' 个已完成分段，可继续下载。'
+          : '信息获取成功，可以开始下载。';
     setStatus(statusMessage);
   };
 
@@ -1648,6 +1685,9 @@ const pageScript = String.raw`
         return cached;
       }
     }
+
+    state.security.bypassForCachedInfo = false;
+    syncTurnstilePrompt();
 
     const infoUrl = buildInfoUrl();
     let retries = 0;
@@ -1756,11 +1796,14 @@ const pageScript = String.raw`
     retryBtn.disabled = true;
     clearCacheBtn.disabled = true;
     clearEnvBtn.disabled = true;
-    if (cancelBtn) {
-      cancelBtn.disabled = true;
-    }
-    state.infoReady = false;
-    setStatus(actionLabel + '中，请稍候...');
+  if (cancelBtn) {
+    cancelBtn.disabled = true;
+  }
+  state.infoReady = false;
+  state.redirectPlainActive = false;
+  state.security.bypassForCachedInfo = false;
+  syncTurnstilePrompt();
+  setStatus(actionLabel + '中，请稍候...');
     log(actionLabel + '操作开始');
 
     if (clearSegments) {
@@ -1785,7 +1828,7 @@ const pageScript = String.raw`
       console.error(error);
       setStatus(actionLabel + '后重新获取信息失败：' + error.message);
       toggleBtn.disabled = false;
-      toggleBtn.textContent = '开始下载';
+      updateToggleLabel();
       retryBtn.disabled = false;
       clearCacheBtn.disabled = false;
       clearEnvBtn.disabled = false;
@@ -2262,6 +2305,9 @@ const pageScript = String.raw`
 
   const startWorkflow = async () => {
     if (state.workflowPromise) return;
+    if (state.redirectPlainActive) {
+      return;
+    }
     state.workflowPromise = (async () => {
       try {
         if (!state.infoReady) return;
@@ -2557,9 +2603,50 @@ const pageScript = String.raw`
     });
   }
 
+  const redirectToRemoteDownload = () => {
+    if (!state.remote || !state.remote.url) {
+      setStatus('缺少远程下载地址，无法跳转。');
+      toggleBtn.disabled = false;
+      updateToggleLabel();
+      retryBtn.disabled = false;
+      clearCacheBtn.disabled = false;
+      clearEnvBtn.disabled = false;
+      if (cancelBtn) {
+        cancelBtn.disabled = true;
+      }
+      return false;
+    }
+    log('已启用直连下载，跳转至源文件：' + state.remote.url);
+    setStatus('正在跳转至源文件下载...');
+    toggleBtn.disabled = true;
+    retryBtn.disabled = true;
+    clearCacheBtn.disabled = true;
+    clearEnvBtn.disabled = true;
+    if (cancelBtn) {
+      cancelBtn.disabled = true;
+    }
+    try {
+      window.location.href = state.remote.url;
+    } catch (error) {
+      console.error('跳转下载失败', error);
+      setStatus('跳转下载失败：' + (error && error.message ? error.message : '未知错误'));
+      toggleBtn.disabled = false;
+      retryBtn.disabled = false;
+      clearCacheBtn.disabled = false;
+      clearEnvBtn.disabled = false;
+      updateToggleLabel();
+      return false;
+    }
+    return true;
+  };
+
   toggleBtn.addEventListener('click', () => {
     if (!state.infoReady) return;
     if (!state.started) {
+      if (state.redirectPlainActive) {
+        redirectToRemoteDownload();
+        return;
+      }
       startWorkflow();
       return;
     }
@@ -2586,12 +2673,18 @@ const pageScript = String.raw`
     clearEnvBtn.disabled = true;
     try {
       await fetchInfo({ initial: true, forceRefresh: true });
+      toggleBtn.disabled = false;
+      updateToggleLabel();
+      if (state.redirectPlainActive) {
+        redirectToRemoteDownload();
+        return;
+      }
       startWorkflow();
     } catch (error) {
       console.error(error);
       setStatus('重新获取信息失败：' + error.message);
       toggleBtn.disabled = false;
-      toggleBtn.textContent = '开始下载';
+      updateToggleLabel();
       retryBtn.disabled = false;
       clearCacheBtn.disabled = false;
       clearEnvBtn.disabled = false;
@@ -2605,7 +2698,7 @@ const pageScript = String.raw`
       clearCacheBtn.disabled = false;
       clearEnvBtn.disabled = false;
       toggleBtn.disabled = false;
-      toggleBtn.textContent = '开始下载';
+      updateToggleLabel();
       retryBtn.disabled = false;
     });
   });
@@ -2617,24 +2710,25 @@ const pageScript = String.raw`
       clearCacheBtn.disabled = false;
       clearEnvBtn.disabled = false;
       toggleBtn.disabled = false;
-      toggleBtn.textContent = '开始下载';
+      updateToggleLabel();
       retryBtn.disabled = false;
     });
   });
 
   const initialise = async () => {
     toggleBtn.disabled = true;
-    toggleBtn.textContent = state.security.underAttack ? '等待验证' : '加载中';
+    toggleBtn.textContent = shouldEnforceTurnstile() ? '等待验证' : '加载中';
     retryBtn.disabled = true;
     clearCacheBtn.disabled = true;
     clearEnvBtn.disabled = true;
+    syncTurnstilePrompt();
     try {
       await fetchInfo({ initial: true });
     } catch (error) {
       console.error(error);
       setStatus('初始化失败：' + error.message);
       toggleBtn.disabled = false;
-      toggleBtn.textContent = '开始下载';
+      updateToggleLabel();
       retryBtn.disabled = false;
     }
   };
@@ -2654,6 +2748,7 @@ const renderLandingPageHtml = (path, options = {}) => {
     underAttack: normalizedOptions.underAttack === true,
     turnstileSiteKey:
       typeof normalizedOptions.turnstileSiteKey === 'string' ? normalizedOptions.turnstileSiteKey : '',
+    redirectPlainDownload: normalizedOptions.redirectPlainDownload === true,
   };
   const securityJson = JSON.stringify(securityConfig).replace(/</g, '\\u003c');
 

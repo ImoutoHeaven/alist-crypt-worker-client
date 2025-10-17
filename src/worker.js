@@ -38,6 +38,7 @@ const ensureRequiredEnv = (env) => {
 const resolveConfig = (env = {}) => {
   ensureRequiredEnv(env);
   const underAttack = parseBoolean(env.UNDER_ATTACK, false);
+  const redirectPlain = parseBoolean(env.REDIRECT, false);
   const turnstileSiteKey = env.TURNSTILE_SITE_KEY ? String(env.TURNSTILE_SITE_KEY).trim() : '';
   const turnstileSecretKey = env.TURNSTILE_SECRET_KEY ? String(env.TURNSTILE_SECRET_KEY).trim() : '';
   if (underAttack && (!turnstileSiteKey || !turnstileSecretKey)) {
@@ -53,6 +54,7 @@ const resolveConfig = (env = {}) => {
     underAttack,
     turnstileSiteKey,
     turnstileSecretKey,
+    redirectPlain,
   };
 };
 
@@ -395,6 +397,7 @@ const handleInfo = async (request, config) => {
         segmentRetry: retry,
         maxConnections: suggestedConnections ? Number(suggestedConnections) : undefined,
         underAttack: config.underAttack,
+        redirectPlain: config.redirectPlain,
       },
     },
   };
@@ -418,6 +421,7 @@ const handleFileRequest = async (request, config) => {
   return renderLandingPage(url.pathname, {
     underAttack: config.underAttack,
     turnstileSiteKey: config.turnstileSiteKey,
+    redirectPlainDownload: config.redirectPlain,
   });
 };
 
