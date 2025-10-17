@@ -2585,7 +2585,7 @@ const pageScript = String.raw`
     }
     const result = applyConnectionLimitValue(trimmed, { notify: true });
     if (!result.ok) {
-      setStatus('最大打开连接数无效，已恢复为默认值 16。请输入 1-32 之间的整数。');
+      setStatus('最大打开连接数无效，已恢复为默认值 4。请输入 1-16 之间的整数。');
       syncConnectionInput();
       connectionLimitInput.focus({ preventScroll: true });
     }
@@ -3047,9 +3047,9 @@ const renderLandingPageHtml = (path, options = {}) => {
           <input id="parallelLimitInput" class="retry-input" type="number" inputmode="numeric" autocomplete="off" min="1" max="32" value="6">
           <label class="retry-label" for="connectionLimitInput">
             最大打开连接数
-            <span class="retry-hint">范围 1-32，默认 4</span>
+            <span class="retry-hint">范围 1-16，默认 4</span>
           </label>
-          <input id="connectionLimitInput" class="retry-input" type="number" inputmode="numeric" autocomplete="off" min="1" max="32" value="16">
+          <input id="connectionLimitInput" class="retry-input" type="number" inputmode="numeric" autocomplete="off" min="1" max="16" value="16">
         </div>
       </aside>
       <div id="advancedBackdrop" class="advanced-backdrop" hidden></div>
