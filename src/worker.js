@@ -429,11 +429,11 @@ const routeRequest = async (request, config) => {
   if (request.method === 'OPTIONS') {
     return handleOptions(request);
   }
-  const ipv4Error = ensureIPv4(request, config.ipv4Only);
-  if (ipv4Error) return ipv4Error;
 
   const pathname = new URL(request.url).pathname || '/';
   if (request.method === 'GET' && pathname === '/info') {
+    const ipv4Error = ensureIPv4(request, config.ipv4Only);
+    if (ipv4Error) return ipv4Error;
     return handleInfo(request, config);
   }
   return handleFileRequest(request, config);
