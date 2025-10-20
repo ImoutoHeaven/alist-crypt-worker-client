@@ -68,8 +68,10 @@ const verifyTurnstileToken = async (secretKey, token, remoteIP) => {
   const payload = new URLSearchParams();
   payload.set('secret', secretKey);
   payload.set('response', token);
-  if (remoteIP) {
-    payload.set('remoteip', remoteIP);
+  const normalizedRemoteIP =
+    typeof remoteIP === 'string' ? remoteIP.trim() : '';
+  if (normalizedRemoteIP) {
+    payload.set('remoteip', normalizedRemoteIP);
   }
   const response = await fetch(TURNSTILE_VERIFY_ENDPOINT, {
     method: 'POST',
@@ -246,9 +248,16 @@ const respondJson = (origin, payload, status = 200) => {
   return new Response(JSON.stringify(payload), { status, headers });
 };
 
+const extractClientIP = (request) => {
+  const raw = request.headers.get('CF-Connecting-IP');
+  if (!raw) return '';
+  const [first] = raw.split(',');
+  return first ? first.trim() : '';
+};
+
 const ensureIPv4 = (request, ipv4Only) => {
   if (!ipv4Only) return null;
-  const clientIP = request.headers.get('CF-Connecting-IP') || '';
+  const clientIP = extractClientIP(request);
   if (clientIP.includes(':')) {
     return respondJson(
       request.headers.get('origin') || '*',
@@ -320,7 +329,7 @@ const handleInfo = async (request, config) => {
     return respondJson(origin, { code: 400, message: 'path is required' }, 400);
   }
 
-  const clientIP = request.headers.get('CF-Connecting-IP') || '';
+  const clientIP = extractClientIP(request);
   if (config.underAttack) {
     const token =
       request.headers.get(TURNSTILE_HEADER) ||
